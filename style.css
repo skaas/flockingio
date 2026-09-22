@@ -9,7 +9,8 @@
   --edge: clamp(20px, 3.75vw, 56px);
 }
 * { box-sizing: border-box; }
-body { margin: 0; overflow: hidden; }
+body { margin: 0; overflow: hidden; width: 100vw; height: 100svh; display: grid; place-items: center; background: #091e24; }
+#viewport-shell { position: relative; width: min(100vw, 56.25vh); height: 100%; overflow: hidden; isolation: isolate; transform: translateZ(0); --edge: clamp(20px, 3.75vw, 56px); }
 button, summary { -webkit-tap-highlight-color: transparent; cursor: pointer; }
 button, input, select { font: inherit; }
 button { border: 0; }
@@ -177,12 +178,12 @@ dd { margin: 0; font-variant-numeric: tabular-nums; }
 @keyframes appear { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 @media (min-width: 1600px) { .home { padding-left: 12%; } .home-hint { left: 12%; } }
-@media (max-width: 900px) {
+@media (max-width: 900px), (min-width: 901px) and (orientation: landscape) {
   .home-copy { background: radial-gradient(ellipse at 20% 50%, #091e2499, transparent 75%); }
   .playing .top-actions { gap: 2px; }
   .flock-signal span { display: none; }
 }
-@media (max-width: 600px) {
+@media (max-width: 600px), (min-width: 601px) and (orientation: landscape) {
   .topbar { padding: 16px 20px; }
   .brand span { font-size: 13px; letter-spacing: 3px; }
   .brand svg { width: 26px; }

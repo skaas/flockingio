@@ -4,6 +4,7 @@ import { RankingClient } from './ranking.mjs';
 import { normalizeNickname, validNickname, rankMode } from './identity.mjs';
 
 const $ = id => document.getElementById(id);
+const viewport = $('viewport-shell');
 const canvas = $('world'), ctx = canvas.getContext('2d', { alpha: false });
 const map = $('minimap').getContext('2d');
 const colors = { lime: '#c9ed92', coral: '#f2957e', gold: '#e6c77f', aqua: '#80cec0' };
@@ -29,7 +30,9 @@ const readBest = key => { const value = readStorage(key, 0); return typeof value
 let soundEnabled = readStorage('murmur-sound', false), audio = null, lastChirp = 0;
 
 function resize() {
-  width = innerWidth; height = innerHeight; dpr = Math.min(devicePixelRatio || 1, 2);
+  const bounds = viewport.getBoundingClientRect();
+  width = bounds.width; height = bounds.height; dpr = Math.min(devicePixelRatio || 1, 2);
+  viewport.style.setProperty('--edge', `${Math.max(20, Math.min(56, width * .0375))}px`);
   canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
   canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
 }
@@ -57,6 +60,10 @@ $('sound').addEventListener('click', () => { soundEnabled = !soundEnabled; saveS
 
 function toast(message, duration = 3.4) { $('toast').textContent = message; $('toast').classList.add('visible'); toastTimer = duration; }
 function resetInput() { keys.clear(); mouseHeld = false; gatherHeld = false; gatherToggle = false; touches.clear(); aim = null; $('gather').setAttribute('aria-pressed', 'false'); }
+function localPointer(event) {
+  const bounds = viewport.getBoundingClientRect();
+  return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+}
 function showModal(id) {
   if (id && !activeModal) modalOrigin = document.activeElement;
   activeModal = id;
@@ -251,7 +258,7 @@ function updateBehavior() {
 function start(duration, practice = false) {
   currentRun = { runId: crypto.randomUUID(), mode: rankMode(duration, practice) };
   lastDuration = duration; lastPractice = practice; resetInput(); showModal(null); $('home').hidden = true; $('hud').hidden = false; $('pause').hidden = false; $('run-clock').hidden = false;
-  document.body.classList.add('playing'); camera = { x: 0, y: 0, zoom: width < 600 ? .74 : 1 }; cameraMotion = { x: 0, y: 0 };
+  document.body.classList.add('playing'); camera = { x: 0, y: 0, zoom: width < 600 ? .88 : 1.2 }; cameraMotion = { x: 0, y: 0 };
   document.body.classList.toggle('practice-mode', Boolean(practice));
   accumulator = 0; detachToastAt = -10;
   $('run-details').open = false;
@@ -294,6 +301,7 @@ updateRecord();
 
 addEventListener('keydown', event => {
   const key = event.key.toLowerCase();
+  const isEvolutionKey = event.code === 'KeyE' || key === 'e' || key === 'ㄷ';
   if (key === 'tab') {
     const dialog = document.querySelector('.modal:not([hidden])');
     if (dialog) {
@@ -310,7 +318,7 @@ addEventListener('keydown', event => {
   if (key === 'escape' || key === 'p') { if (game.state === 'playing') game.pause(); else if (game.state === 'paused') game.resume(); return; }
   if (game.state === 'upgrade' && ['1', '2', '3'].includes(key)) { game.chooseUpgrade(Number(key) - 1); return; }
   if (game.state === 'playing') {
-    if (key === 'e') { event.preventDefault(); requestEvolution(); return; }
+    if (isEvolutionKey) { event.preventDefault(); requestEvolution(); return; }
     // Space activates a focused control; it only boosts while steering the canvas.
     if (event.target.closest?.('button, summary') && [' ', 'enter'].includes(key)) return;
     if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) event.preventDefault();
@@ -320,17 +328,18 @@ addEventListener('keydown', event => {
 addEventListener('keyup', event => keys.delete(event.key.toLowerCase()));
 canvas.addEventListener('pointermove', event => {
   if (event.pointerType === 'touch' && !touches.has(event.pointerId)) return;
-  if (event.pointerType === 'touch') touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  aim = { x: event.clientX, y: event.clientY };
+  const point = localPointer(event);
+  if (event.pointerType === 'touch') touches.set(event.pointerId, point);
+  aim = point;
 });
 canvas.addEventListener('pointerdown', event => {
   if (game.state !== 'playing') return;
   canvas.focus({ preventScroll: true });
   canvas.setPointerCapture(event.pointerId);
-  if (event.pointerType === 'touch') touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  if (event.pointerType === 'touch') touches.set(event.pointerId, localPointer(event));
   else if (event.button === 2) gatherHeld = true;
   else if (event.button === 0) mouseHeld = true;
-  aim = { x: event.clientX, y: event.clientY };
+  aim = localPointer(event);
 });
 canvas.addEventListener('contextmenu', event => { if (game.state !== 'home') event.preventDefault(); });
 function releasePointer(event) { if (event.button === 2 || event.type === 'pointercancel') gatherHeld = false; if (event.button === 0 || event.type === 'pointercancel') mouseHeld = false; touches.delete(event.pointerId); if (event.pointerType === 'touch' && !touches.size) aim = null; }
@@ -528,7 +537,12 @@ function drawWorld(dt) {
   const focusY = lerp(centerY, p.y, .48) + Math.sin(p.angle) * 22;
   const extentX = Math.max(100, ...[p, ...p.boids].map(b => Math.abs(b.x - focusX)));
   const extentY = Math.max(100, ...[p, ...p.boids].map(b => Math.abs(b.y - focusY)));
-  const targetZoom = Math.min(width < 600 ? 1 : 1.25, (width / 2 - 28) / extentX, (height / 2 - 110) / extentY);
+  // Start closer to the flock, then gradually widen the view as the leader
+  // evolves. The fit limits still protect the flock from being clipped.
+  const closeZoom = width < 600 ? 1.15 : 1.5;
+  const evolutionProgress = clamp((headScaleForLevel(game.level) - 1) / (HEAD_GROWTH.maxScale - 1), 0, 1);
+  const evolutionZoom = lerp(1, .78, evolutionProgress);
+  const targetZoom = Math.min(closeZoom * evolutionZoom, (width / 2 - 28) / extentX, (height / 2 - 110) / extentY);
   const previousX = camera.x, previousY = camera.y;
   camera.x = lerp(camera.x, focusX, 1 - Math.exp(-dt * 4)); camera.y = lerp(camera.y, focusY, 1 - Math.exp(-dt * 4));
   if (dt > 0) {

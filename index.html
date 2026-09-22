@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div id="viewport-shell">
   <canvas id="world" tabindex="-1" aria-label="머리를 조종해 군체를 이끄는 생존 게임"></canvas>
   <div class="vignette" aria-hidden="true"></div>
   <header class="topbar" id="topbar">
@@ -115,7 +116,7 @@
         <div><dt>이동</dt><dd><span class="desktop-copy">마우스 · WASD · 방향키</span><span class="touch-copy">손가락으로 드래그</span></dd></div>
         <div><dt>가속</dt><dd><span class="desktop-copy">Space · 왼쪽 클릭 유지</span><span class="touch-copy">두 손가락 터치</span></dd></div>
         <div><dt>감속·결집</dt><dd><span class="desktop-copy">Shift · 오른쪽 클릭 유지</span><span class="touch-copy">화면의 결집 버튼</span></dd></div>
-        <div><dt>진화</dt><dd>에너지를 모은 뒤 진화하기<span class="desktop-copy"> · E</span></dd></div>
+        <div><dt>진화</dt><dd>에너지를 모은 뒤 진화하기<span class="desktop-copy"> · E 위치 키</span></dd></div>
         <div><dt>일시정지</dt><dd><span class="desktop-copy">Esc · P</span><span class="touch-copy">오른쪽 위 일시정지 버튼</span></dd></div>
       </dl>
       <div class="help-rules"><p><strong>머리를 지키세요.</strong> 내 머리가 적 몸통에 닿으면 끝납니다. 적 머리를 내 무리로 유도하세요. 머리끼리 부딪히면 둘 다 쓰러집니다.</p><p><strong>먹이를 모아 진화해요.</strong> 쓰러진 적의 잔해를 먹으면 친구가 늘고 진화 에너지가 쌓여요. 준비가 되면 아래의 ‘진화하기’를 누르세요. 시간이 멈추고 새로운 힘을 고를 수 있어요. 나중에 눌러도 모은 에너지는 그대로 남아요.</p><p><strong>진화하면 커지고 빨라져요.</strong> 대장이 최대 4배까지 커지면 기본 속도도 2배가 돼요. 더 빨리 가기와 가속도 함께 쓸 수 있어요. 몸이 큰 만큼 부딪히지 않게 조심하세요.</p></div>
@@ -152,6 +153,7 @@
       <button class="primary-button" id="close-ranking">닫기 <span aria-hidden="true">→</span></button>
     </div>
   </section>
+</div>
   <script type="module" src="src/app.mjs"></script>
 </body>
 </html>
