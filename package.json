@@ -1,0 +1,11 @@
+{
+  "name": "murmur-flock-survivor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server/local.mjs",
+    "build": "node scripts/build-sites.mjs",
+    "test": "node --test tests/*.test.mjs"
+  }
+}

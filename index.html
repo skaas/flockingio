@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#091e24">
+  <title>MURMUR — 군체의 생존</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23091e24'/%3E%3Cpath d='M12 44L24 17L32 34L40 17L52 44' fill='none' stroke='%23c9f18b' stroke-width='6'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="world" tabindex="-1" aria-label="머리를 조종해 군체를 이끄는 생존 게임"></canvas>
+  <div class="vignette" aria-hidden="true"></div>
+  <header class="topbar" id="topbar">
+    <div class="brand" aria-label="MURMUR"><svg viewBox="0 0 36 32" aria-hidden="true"><path d="M2 27 11 6 18 21 25 6 34 27"/></svg><span>MURMUR</span></div>
+    <div class="run-clock" id="run-clock" hidden>
+      <span id="phase-label">고요한 수면</span>
+      <div><span id="clock">00:00</span><span class="time-target" id="time-target"> / 30:00</span></div>
+      <div class="time-track" aria-hidden="true"><i id="time-fill"></i></div>
+      <span class="run-best" id="run-best" hidden></span>
+    </div>
+    <div class="top-actions">
+      <button class="quiet-button" id="rank-home" aria-haspopup="dialog">랭킹</button>
+      <button class="quiet-button" id="help" aria-haspopup="dialog">도움말</button>
+      <button class="icon-button" id="sound" aria-label="소리 켜기" title="소리 켜기" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Zm4 3a6 6 0 0 1 0 8"/><path class="sound-slash" d="m3 3 18 18"/></svg>
+      </button>
+      <button class="icon-button" id="pause" aria-label="일시정지" title="일시정지 (Esc)" aria-haspopup="dialog" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5v14M15 5v14"/></svg></button>
+    </div>
+  </header>
+  <main id="home" class="home">
+    <div class="home-copy">
+      <h1>함께, <em>더 멀리.</em></h1>
+      <p class="intro">당신의 이름으로 생존 기록을 남겨보세요.</p>
+      <form id="start-form" class="start-form">
+        <label for="nickname">닉네임</label>
+        <input id="nickname" name="nickname" type="text" placeholder="어떤 이름으로 날아볼까요?" maxlength="16" required autocomplete="nickname" enterkeyhint="go" aria-describedby="player-identity nickname-error">
+        <p id="player-identity" class="player-identity">이름이 같아도 고유번호로 구분해요.</p>
+        <p id="nickname-error" class="input-error" role="alert" hidden></p>
+        <button type="submit" class="primary-button" id="start">플레이 <span aria-hidden="true">→</span></button>
+      </form>
+      <details class="other-modes" id="other-modes">
+        <summary>다른 방식으로 시작</summary>
+        <div class="mode-list">
+          <button id="classic"><span>긴 생존</span><small>기존 30분 모드</small><span aria-hidden="true">→</span></button>
+          <button id="quick"><span>빠른 플레이</span><small>3분 생존</small><span aria-hidden="true">→</span></button>
+          <button id="practice"><span>조작 연습</span><small>적 없이 자유 비행</small><span aria-hidden="true">→</span></button>
+          <button id="recruit-practice"><span>꼬리 데려오기 연습</span><small>내 12마리 vs 적 64마리</small><span aria-hidden="true">→</span></button>
+        </div>
+      </details>
+      <p class="best-record" id="best-record" hidden></p>
+      <p class="ranking-note">게임이 끝나면 최고 기록이 랭킹에 자동 등록돼요.</p>
+    </div>
+    <p class="home-hint"><span class="desktop-copy">마우스로 방향을 잡으세요. 무리가 따라옵니다.</span><span class="touch-copy">드래그로 방향을 잡으세요. 무리가 따라옵니다.</span></p>
+  </main>
+  <div id="hud" hidden>
+    <aside class="run-stats" aria-label="내 무리">
+      <div class="flock-number"><span id="flock-count">12</span><small>마리</small></div>
+      <div class="flock-signals" aria-live="polite">
+        <div class="flock-signal warning" id="sway-signal" hidden>동요 <b id="sway-count">0</b><span> · 결집해 보호하세요</span></div>
+        <div class="flock-signal" id="recruit-signal" hidden>합류 중 <b id="recruit-count">0</b>마리 · <b id="recruit-progress" aria-live="off">0%</b></div>
+      </div>
+    </aside>
+    <div class="boost-panel">
+      <button id="gather" class="gather-button" aria-pressed="false" aria-label="감속하고 군체 모으기">결집 <kbd class="desktop-copy">Shift</kbd></button>
+      <div class="boost-label"><span id="energy-label">가속</span><kbd class="desktop-copy">Space</kbd><span class="touch-copy">두 손가락</span></div>
+      <div class="boost-track" id="energy-meter" role="progressbar" aria-label="가속 에너지" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100"><i id="boost-fill"></i></div>
+    </div>
+    <div class="xp-panel">
+      <div class="xp-label"><span>진화 <b id="level">1</b>단계</span><span id="xp-label">0 / 48</span></div>
+      <div class="xp-track" id="xp-meter" role="progressbar" aria-label="진화 에너지" aria-valuemin="0" aria-valuemax="48" aria-valuenow="0"><i id="xp-fill"></i></div>
+      <button id="evolve" class="evolve-button" disabled aria-haspopup="dialog" aria-describedby="evolution-status">진화하기 <kbd class="desktop-copy">E</kbd></button>
+      <p id="evolution-status" class="evolution-status" role="status">먹이로 진화 에너지를 모아요</p>
+    </div>
+    <div class="minimap-wrap"><canvas id="minimap" width="160" height="160" aria-label="군체 위치 지도"></canvas></div>
+    <div id="toast" class="toast" role="status"></div>
+    <div id="recruit-guide" class="recruit-guide" hidden>
+      <strong id="recruit-lesson">꼬리 옆에서 함께 날아요</strong>
+      <p id="recruit-instruction">결집을 켜 두었어요. 그대로 오른쪽으로 날며 초록 원이 차는 모습을 보세요. 연습 상대는 직진해요.</p>
+      <button id="retry-recruit" class="text-button">같은 장면 다시 해보기</button>
+    </div>
+  </div>
+  <section id="upgrade-modal" class="modal" hidden aria-labelledby="upgrade-title" role="dialog" aria-modal="true">
+    <div class="upgrade-inner">
+      <span class="eyebrow">진화</span>
+      <h2 id="upgrade-title">어떤 힘을 키울까요?</h2>
+      <p id="upgrade-description">시간은 멈춰 있어요. 무리를 키울 힘을 골라주세요.</p>
+      <div id="upgrade-cards" class="upgrade-cards"></div>
+      <div class="modal-footnote desktop-copy">클릭 또는 숫자 키 1 · 2 · 3으로 선택</div>
+    </div>
+  </section>
+  <section id="pause-modal" class="modal" hidden aria-labelledby="pause-title" role="dialog" aria-modal="true">
+    <div class="small-modal">
+      <h2 id="pause-title">잠시, 숨 고르기.</h2>
+      <p>무리는 여기서 기다릴게요.</p>
+      <button class="primary-button" id="resume">계속하기 <span aria-hidden="true">→</span></button>
+      <details class="run-details" id="run-details">
+        <summary>이번 무리의 기록과 능력</summary>
+        <dl class="detail-stats">
+          <div><dt>처치한 군체</dt><dd id="kills">0</dd></div>
+          <div><dt>흡수한 먹이</dt><dd id="food-count">0</dd></div>
+          <div><dt>누적 이탈</dt><dd id="detached-count">0</dd></div>
+          <div><dt>대장 크기</dt><dd id="head-size">1배 / 최대 4배</dd></div>
+        </dl>
+        <div id="behavior-stats"></div>
+      </details>
+      <div class="pause-links"><button class="text-button" id="pause-help">조작과 생존 규칙</button><button class="text-button" id="quit">시작 화면으로</button></div>
+    </div>
+  </section>
+  <section id="help-modal" class="modal" hidden aria-labelledby="help-title" role="dialog" aria-modal="true">
+    <div class="small-modal help-inner">
+      <h2 id="help-title">함께 살아남는 법</h2>
+      <p>머리를 이끌면, 무리가 따라옵니다.</p>
+      <dl class="controls-list">
+        <div><dt>이동</dt><dd><span class="desktop-copy">마우스 · WASD · 방향키</span><span class="touch-copy">손가락으로 드래그</span></dd></div>
+        <div><dt>가속</dt><dd><span class="desktop-copy">Space · 왼쪽 클릭 유지</span><span class="touch-copy">두 손가락 터치</span></dd></div>
+        <div><dt>감속·결집</dt><dd><span class="desktop-copy">Shift · 오른쪽 클릭 유지</span><span class="touch-copy">화면의 결집 버튼</span></dd></div>
+        <div><dt>진화</dt><dd>에너지를 모은 뒤 진화하기<span class="desktop-copy"> · E</span></dd></div>
+        <div><dt>일시정지</dt><dd><span class="desktop-copy">Esc · P</span><span class="touch-copy">오른쪽 위 일시정지 버튼</span></dd></div>
+      </dl>
+      <div class="help-rules"><p><strong>머리를 지키세요.</strong> 내 머리가 적 몸통에 닿으면 끝납니다. 적 머리를 내 무리로 유도하세요. 머리끼리 부딪히면 둘 다 쓰러집니다.</p><p><strong>먹이를 모아 진화해요.</strong> 쓰러진 적의 잔해를 먹으면 친구가 늘고 진화 에너지가 쌓여요. 준비가 되면 아래의 ‘진화하기’를 누르세요. 시간이 멈추고 새로운 힘을 고를 수 있어요. 나중에 눌러도 모은 에너지는 그대로 남아요.</p><p><strong>진화하면 커지고 빨라져요.</strong> 대장이 최대 4배까지 커지면 기본 속도도 2배가 돼요. 더 빨리 가기와 가속도 함께 쓸 수 있어요. 몸이 큰 만큼 부딪히지 않게 조심하세요.</p></div>
+      <details class="help-details">
+        <summary>동료의 합류와 이탈</summary>
+        <p>적 꼬리의 끝부분 옆에 친구들을 모으고 같은 방향으로 함께 날아보세요. 그 자리에서 우리 친구들이 더 가까이 많이 모여 있으면 데려올 수 있어요. 적 전체가 더 커도 괜찮아요.</p>
+        <p>초록 원이 다 차면 새 친구가 돼요. 머리로 적 몸통을 들이받으면 안 돼요. 금색 원은 빼앗길 수 있는 우리 친구예요. 가까이 돌아가 결집하면 지키기 좋아요.</p>
+        <p>금색 점선은 끊어지기 쉬운 연결입니다. 떨어진 회색 개체는 무소속이 되며, 가까이 함께 움직이면 다시 합류할 수 있습니다.</p>
+      </details>
+      <button class="primary-button" id="close-help">닫기 <span aria-hidden="true">→</span></button>
+    </div>
+  </section>
+  <section id="end-modal" class="modal" hidden aria-labelledby="end-title" role="dialog" aria-modal="true">
+    <div class="small-modal end-inner">
+      <h2 id="end-title">흩어져도, 다시.</h2><p id="end-reason"></p>
+      <div class="end-stats"><div><span>생존 시간</span><b id="end-time"></b></div><div><span>최대 군체</span><b id="end-flock"></b></div><div><span>처치</span><b id="end-kills"></b></div></div>
+      <p class="end-record" id="end-record" hidden></p>
+      <p class="rank-result" id="rank-result" role="status" hidden></p>
+      <div class="build-summary" id="build-summary"></div>
+      <button class="primary-button" id="restart">바로 재도전 <span aria-hidden="true">→</span></button>
+      <p class="retry-hint desktop-copy">버튼 클릭 또는 R · 바로 다시 날아요</p>
+      <button class="text-button" id="rank-end" aria-haspopup="dialog" hidden>랭킹 보기</button>
+      <button class="text-button" id="home-button">시작 화면으로</button>
+    </div>
+  </section>
+  <section id="ranking-modal" class="modal" hidden aria-labelledby="ranking-title" role="dialog" aria-modal="true">
+    <div class="small-modal ranking-inner">
+      <h2 id="ranking-title">생존 랭킹</h2>
+      <p>모드별 최고 기록 · 생존 시간순</p>
+      <div class="ranking-toolbar"><label for="ranking-mode" class="sr-only">랭킹 모드</label><select id="ranking-mode"><option value="challenge">기록 도전</option><option value="classic">긴 생존 · 30분</option><option value="quick">빠른 플레이 · 3분</option></select><button class="text-button" id="refresh-ranking">새로고침</button></div>
+      <p id="ranking-status" class="ranking-status" role="status">랭킹을 불러오는 중이에요.</p>
+      <ol id="ranking-list" class="ranking-list" aria-label="상위 10명"></ol>
+      <div id="my-ranking" class="my-ranking" hidden></div>
+      <button class="primary-button" id="close-ranking">닫기 <span aria-hidden="true">→</span></button>
+    </div>
+  </section>
+  <script type="module" src="src/app.mjs"></script>
+</body>
+</html>
