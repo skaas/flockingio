@@ -19,7 +19,7 @@ test('gathering slows the head and compresses a living flock, then releasing exp
     const input = { dx: Math.cos(i / 60 * .35), dy: Math.sin(i / 60 * .35) };
     normal.game.update(1 / 60, input); gathered.game.update(1 / 60, { ...input, gather: i > 300 });
   }
-  assert.equal(gathered.p.boids.length, 48); assert.equal(gathered.game.strays.length, 0);
+  assert.equal(gathered.p.boids.length, 8); assert.equal(gathered.game.strays.length, 0);
   const tight = spread(gathered.p.boids);
   assert.ok(tight < spread(normal.p.boids) * .8);
   assert.ok(gathered.p.speed < normal.p.speed * .65);
@@ -66,8 +66,8 @@ test('escaped birds cannot absorb player experience or earn player kills', () =>
 test('a head can lose every bird without dragging the camera flock or ending the run', () => {
   const { game, p } = setup(); p.x = 1000; p.y = 1000;
   game.update(1 / 60, { dx: 1 });
-  assert.equal(p.boids.length, 0); assert.equal(game.strays.length, 48); assert.equal(game.state, 'playing');
-  assert.equal(game.lostFollowers, 48); assert.equal(game.xp, 0);
+  assert.equal(p.boids.length, 0); assert.equal(game.strays.length, 8); assert.equal(game.state, 'playing');
+  assert.equal(game.lostFollowers, 8); assert.equal(game.xp, 0);
 });
 
 test('neutral birds join a nearby flock through sustained contact, without free experience', () => {
@@ -102,9 +102,9 @@ test('turning and boosting change the flock flow, while gather takes priority ov
 test('practice is enemy-free, and pause and restart preserve their ownership guarantees', () => {
   const { game, p } = setup();
   for (let i = 0; i < 1200; i++) game.update(1 / 60, { dx: Math.cos(i / 180), dy: Math.sin(i / 180) });
-  assert.equal(game.entities.length, 1); assert.equal(p.boids.length, 48); assert.equal(game.xp, 0);
+  assert.equal(game.entities.length, 1); assert.equal(p.boids.length, 8); assert.equal(game.xp, 0);
   place(p.boids[0], -1000, -1000); game.pause(); game.update(1 / 60);
-  assert.equal(p.boids.length, 48); assert.equal(game.strays.length, 0);
+  assert.equal(p.boids.length, 8); assert.equal(game.strays.length, 0);
   game.resume(); game.update(1 / 60); assert.ok(game.strays.length > 0);
-  game.start(); assert.equal(game.practice, false); assert.equal(game.strays.length, 0); assert.equal(game.detachedFollowers, 0); assert.equal(game.player.boids.length, 12);
+  game.start(); assert.equal(game.practice, false); assert.equal(game.strays.length, 0); assert.equal(game.detachedFollowers, 0); assert.equal(game.player.boids.length, 4);
 });

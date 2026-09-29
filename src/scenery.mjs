@@ -1,5 +1,6 @@
-// Decorative landmarks are fixed in world space. They never use game randomness,
-// influence movement, or resemble the bright food dropped by defeated flocks.
+import { sprite } from './sprites.mjs';
+// Terrain and abandoned earthworks stay fixed in world space and never consume
+// simulation randomness. Live objectives are drawn separately.
 const TAU = Math.PI * 2;
 function noise(x, y, salt = 0) {
   const n = Math.sin(x * 127.1 + y * 311.7 + salt * 74.7) * 43758.5453;
@@ -63,6 +64,10 @@ export class Scenery {
     // The ground is a one-to-one reference for distance and turns. Returning to
     // a location reveals exactly the same shapes, including after camera zooms.
     layer(1);
+    ctx.strokeStyle = '#64705b'; ctx.globalAlpha = .15; ctx.lineWidth = 16;
+    for (let road = -3; road <= 3; road++) {
+      ctx.beginPath(); ctx.moveTo(-2300, road * 510 - 320); ctx.lineTo(0, road * 510 + 40); ctx.lineTo(2300, road * 510 - 180); ctx.stroke();
+    }
     for (const p of this.landmarks) {
       if (!visible(p, 1, p.size * 1.3)) continue;
       ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.angle); ctx.scale(1, p.aspect);
@@ -74,6 +79,21 @@ export class Scenery {
       ctx.strokeStyle = '#6c9992'; ctx.globalAlpha = .23;
       ctx.beginPath(); ctx.moveTo(-p.size * .17, p.size * .1); ctx.lineTo(p.size * .06, p.size * .2);
       ctx.lineTo(p.size * .21, p.size * .07); ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.translate(p.x + p.size * .35, p.y); ctx.rotate(p.angle);
+      ctx.strokeStyle = '#8a8868'; ctx.globalAlpha = .24; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(-45, -8); ctx.lineTo(-23, -8); ctx.lineTo(-23, 4); ctx.lineTo(3, 4); ctx.lineTo(3, -8); ctx.lineTo(33, -8); ctx.stroke();
+      ctx.fillStyle = '#101e20'; ctx.globalAlpha = .5;
+      ctx.beginPath(); ctx.ellipse(45, 38, 18, 13, .3, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#847a58'; ctx.lineWidth = 2; ctx.globalAlpha = .2; ctx.stroke(); ctx.restore();
+    }
+    // The abandoned airfield and scattered outposts are fixed world landmarks.
+    ctx.globalAlpha = .32; sprite(ctx, 'airport', -520, -520, 1040);
+    for (let i = 0; i < this.landmarks.length; i++) {
+      const p = this.landmarks[i];
+      if (i % 3 || !visible(p, 1, 100) || Math.hypot(p.x, p.y) < 550) continue;
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(Math.round(p.angle / (Math.PI / 2)) * Math.PI / 2);
+      ctx.globalAlpha = .62; sprite(ctx, i % 2 ? 'hangarRuined' : 'depot', -42, -42, 84);
+      ctx.globalAlpha = .45; sprite(ctx, 'carrier', 52, 15, 30); ctx.restore();
     }
     ctx.restore();
 

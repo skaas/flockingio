@@ -39,10 +39,11 @@ test('an enemy head hitting the player tail drops food and awards one kill', () 
 
 test('the arena starts empty and surviving alone never generates food or experience', () => {
   const { game } = makeGame(); assert.equal(game.food.length, 0);
+  game.bombardment.enabled = false; // No support requests or responding enemies in this empty-arena scenario.
   game.entities = [game.player]; game.spawnTimer = 999;
   for (let i = 0; i < 1800; i++) game.update(1 / 60, { dx: Math.cos(i / 150), dy: Math.sin(i / 150) });
   assert.equal(game.food.length, 0); assert.equal(game.xp, 0); assert.equal(game.level, 1);
-  assert.equal(game.collected, 0); assert.equal(game.player.boids.length, 12);
+  assert.equal(game.collected, 0); assert.equal(game.player.boids.length, 4);
 });
 
 test('rival-on-rival deaths leave loot, but only collecting it grants experience', () => {
@@ -176,14 +177,14 @@ test('head collisions respect either heads spawn grace and ignore already dead h
     assert.equal(enemy.alive, kind !== 'dead');
   }
 });
-test('food adds energy and bodies, then waits for an evolution request before pausing', () => {
+test('food adds upgrade energy without drones and waits for a choice before pausing', () => {
   const { game, events } = makeGame(); game.entities = [game.player]; game.food = [];
   for (let i = 0; i < 48; i++) game.addFood({ x: 0, y: 0 });
-  game.collectFood(1 / 60); assert.equal(game.collected, 48); assert.equal(game.player.boids.length, 24);
+  game.collectFood(1 / 60); assert.equal(game.collected, 48); assert.equal(game.player.boids.length, 4);
   assert.equal(game.level, 1); assert.equal(game.state, 'playing'); assert.equal(game.canEvolve(), true);
   assert.ok(events.some(e => e.type === 'evolution-ready')); assert.ok(!events.some(e => e.type === 'upgrade'));
   assert.equal(game.levelUp(), true);
-  assert.equal(game.level, 2); assert.equal(game.state, 'upgrade'); assert.deepEqual(game.choices.map(u => u.id), ['separation', 'cohesion', 'alignment']);
+  assert.equal(game.level, 2); assert.equal(game.state, 'upgrade'); assert.equal(game.choices.length, 3); assert.equal(new Set(game.choices.map(u => u.id)).size, 3);
   assert.ok(events.some(e => e.type === 'upgrade'));
 });
 test('pause and upgrade freeze time, movement, energy and spawning', () => {
@@ -196,20 +197,21 @@ test('pause and upgrade freeze time, movement, energy and spawning', () => {
 });
 test('choice is applied once, invalid input does not resume the game', () => {
   const { game } = makeGame(); game.xp = game.nextXp; game.levelUp();
+  const chosen = game.choices[0].id;
   assert.equal(game.chooseUpgrade(10), false); assert.equal(game.state, 'upgrade');
-  assert.equal(game.chooseUpgrade(0), true); assert.equal(game.stats.separation, 1); assert.equal(game.state, 'playing');
-  assert.equal(game.chooseUpgrade(0), false); assert.equal(game.stats.separation, 1);
+  assert.equal(game.chooseUpgrade(0), true); assert.equal(game.stats[chosen], 1); assert.equal(game.state, 'playing');
+  assert.equal(game.chooseUpgrade(0), false); assert.equal(game.stats[chosen], 1);
 });
 test('maxed upgrades are excluded and full mastery cannot softlock', () => {
-  const { game } = makeGame(); game.level = 5; for (const u of UPGRADES) game.stats[u.id] = 5;
+  const { game } = makeGame(); game.level = 5; for (const u of UPGRADES) game.stats[u.id] = u.max;
   game.stats.cohesion = 4; game.xp = game.nextXp; game.levelUp();
   assert.deepEqual(game.choices.map(u => u.id), ['cohesion']); game.chooseUpgrade(0);
   game.xp = game.nextXp; game.levelUp(); assert.equal(game.state, 'playing'); assert.equal(game.energy, 100);
 });
 test('new runs clear upgrades, growth progress and previous outcome', () => {
-  const { game } = makeGame(); game.stats.separation = 3; game.growthProgress = 3; game.kills = 4; game.start(180);
-  assert.equal(game.stats.separation, 0); assert.equal(game.growthProgress, 0); assert.equal(game.kills, 0);
-  assert.equal(game.duration, 180); assert.equal(game.player.boids.length, 12);
+  const { game } = makeGame(); game.stats.separation = 3; game.player.growthProgress = 3; game.kills = 4; game.start(180);
+  assert.equal(game.stats.separation, 0); assert.equal(game.player.growthProgress, 0); assert.equal(game.kills, 0);
+  assert.equal(game.duration, 180); assert.equal(game.player.boids.length, 4);
 });
 test('boost consumes finite energy and recovers when released', () => {
   const { game } = makeGame(); for (let i = 0; i < 120; i++) game.steerPlayer(1 / 60, { boost: true });
@@ -232,6 +234,13 @@ test('30 minute and quick runs finish at their respective duration', () => {
 test('spatial grid finds targets across positive and negative cell edges', () => {
   const grid = new SpatialGrid(50); const items = [{ x: -1, y: -1 }, { x: 1, y: 1 }, { x: 102, y: 50 }];
   items.forEach(i => grid.add(i)); assert.ok(grid.near(0, 0, 5).includes(items[0])); assert.ok(grid.near(0, 0, 5).includes(items[1])); assert.ok(!grid.near(0, 0, 5).includes(items[2]));
+  const streamed = [];
+  assert.equal(grid.forEachNear(0, 0, 5, item => streamed.push(item)), true);
+  assert.deepEqual(streamed, grid.near(0, 0, 5));
+  let visited = 0;
+  assert.equal(grid.forEachNear(0, 0, 5, () => ++visited < 2), false);
+  assert.equal(visited, 2);
+  grid.clear(); assert.deepEqual(grid.near(0, 0, 5), []);
 });
 test('a large flock stays finite and within its size cap during sharp turns', () => {
   const { game } = makeGame(); game.entities = [game.player]; game.food = []; game.spawnTimer = 999;

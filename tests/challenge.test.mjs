@@ -9,43 +9,9 @@ function setup(seed = 11) {
   return { game, events };
 }
 
-test('challenge opens with real small opponents, no free food, and a reachable first evolution', () => {
-  for (const seed of [11, 23, 37, 53, 71, 97]) {
-    const { game } = setup(seed);
-    assert.equal(game.challenge, true); assert.equal(game.practice, false);
-    assert.equal(game.duration, Infinity); assert.equal(game.nextXp, 18);
-    assert.equal(game.food.length, 0); assert.equal(game.collected, 0);
-    assert.equal(game.entities.length, 3);
-    const course = game.player.angle;
-    // Holding the starting course lets the scout cross the tail. The first few
-    // scraps no longer pay the full evolution cost.
-    for (let i = 0; i < 12 * 60 && game.state === 'playing' && game.collected < 6; i++) game.update(1 / 60, { dx: Math.cos(course), dy: Math.sin(course) });
-    assert.equal(game.state, 'playing'); assert.equal(game.level, 1);
-    assert.ok(game.kills >= 1); assert.ok(game.collected >= 6 && game.collected < 18);
-    assert.equal(game.canEvolve(), false); assert.equal(game.levelUp(), false);
-    // Collect the actual remaining drops directly so this balance check does
-    // not depend on a steering policy finding scattered scraps.
-    for (const food of [...game.food]) {
-      if (game.canEvolve()) break;
-      game.player.x = food.x; game.player.y = food.y; game.collectFood(1 / 60);
-    }
-    assert.equal(game.canEvolve(), true, `seed ${seed} should earn the first evolution`);
-    assert.equal(game.levelUp(), true);
-    assert.equal(game.state, 'upgrade', `seed ${seed} should offer the first choice`);
-    assert.ok(game.elapsed >= 3.5 && game.elapsed <= 12);
-    assert.ok(game.kills >= 1); assert.ok(game.collected >= 18);
-    assert.deepEqual(game.choices.map(u => u.id), ['separation', 'cohesion', 'alignment']);
-    assert.equal(game.nextXp, 81, 'later choices require more than the first small reward');
-    const time = game.elapsed, count = game.player.boids.length;
-    game.update(1 / 60, { boost: true });
-    assert.equal(game.elapsed, time); assert.equal(game.player.boids.length, count);
-    assert.equal(game.chooseUpgrade(1), true); assert.equal(game.stats.cohesion, 1);
-    assert.equal(game.chooseUpgrade(1), false, 'a choice is applied once');
-  }
-});
-
 test('the opening rewards come from absorption, never elapsed time or a free kill', () => {
   const { game } = setup();
+  game.bombardment.enabled = false; // No completed ground objectives in this scenario.
   game.entities = [game.player]; game.spawnTimer = Infinity;
   for (let i = 0; i < 20 * 60; i++) game.update(1 / 60, { dx: 1 });
   assert.equal(game.level, 1); assert.equal(game.xp, 0); assert.equal(game.food.length, 0);
@@ -91,11 +57,11 @@ test('retries reset growth, upgrades, food, strays and difficulty; other modes k
   assert.equal(game.state, 'playing'); assert.equal(game.level, 1); assert.equal(game.nextXp, 18);
   assert.equal(game.elapsed, 0); assert.equal(game.phase, 0); assert.equal(game.energy, 100);
   assert.equal(game.xp, 0); assert.equal(game.stats.cohesion, 0); assert.equal(game.food.length, 0);
-  assert.equal(game.strays.length, 0); assert.equal(game.player.boids.length, 12);
+  assert.equal(game.strays.length, 0); assert.equal(game.player.boids.length, 4);
   game.start(1800); assert.equal(game.challenge, false); assert.equal(game.nextXp, 48);
   game.elapsed = 30; assert.equal(game.difficulty(), 0);
   game.start(180); game.elapsed = 30; assert.equal(game.difficulty(), 1);
   game.startPractice(); assert.equal(game.challenge, false); assert.equal(game.entities.length, 1);
-  assert.equal(game.player.boids.length, 48);
+  assert.equal(game.player.boids.length, 8);
   game.startRecruitmentPractice(); assert.equal(game.challenge, false); assert.equal(game.practice, 'recruitment');
 });

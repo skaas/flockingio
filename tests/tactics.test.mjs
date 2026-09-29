@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { FLEET } from '../src/rules.mjs';
 import { Game, FLIGHT, MAX_FLOCK, angleDelta } from '../src/engine.mjs';
 
 function setup() {
@@ -14,9 +15,9 @@ function place(b, x, y, speed = 83, angle = 0) {
 function edgeScenario() {
   const game = setup(), small = game.player;
   place(small, 55, 35);
-  for (let i = 0; i < 12; i++) game.addBoid(small);
+  for (let i = 0; i < 4; i++) game.addBoid(small);
   small.boids.forEach((b, i) => place(b, -12 - i % 4 * 14, 24 + Math.floor(i / 4) * 14));
-  const large = game.makeFlock(-320, 0, 0, 64); large.invincible = 0;
+  const large = game.makeFlock(-320, 0, 0, 16); large.invincible = 0;
   large.boids.forEach((b, i) => place(b, -350 - i % 8 * 12, Math.floor(i / 8) * 12));
   const chain = large.boids.slice(-4);
   chain.forEach((b, i) => place(b, [-230, -135, -45, 0][i], 0));
@@ -26,7 +27,7 @@ function edgeScenario() {
 
 test('a small flock can pressure a connected but exposed edge of a larger flock', () => {
   const { game, small, large, bird } = edgeScenario();
-  assert.equal(large.boids.length, 64); assert.equal(game.strays.length, 0);
+  assert.equal(large.boids.length, 16); assert.equal(game.strays.length, 0);
   assert.ok(game.flockPower(small) < game.flockPower(large));
   const pressure = game.competingFlock(large, bird, 320);
   assert.equal(pressure?.id, small.id);
@@ -48,7 +49,7 @@ test('a small escort recruits over time without instant conversion or a global s
     if (i < 60) assert.equal(bird.owner, large.id);
   }
   assert.equal(bird.owner, small.id); assert.ok(small.boids.includes(bird));
-  assert.equal(small.boids.length + large.boids.length, 76);
+  assert.equal(small.boids.length + large.boids.length, 20);
   assert.equal(game.xp, 0); assert.equal(game.kills, 0);
 });
 
@@ -152,7 +153,7 @@ test('nearest collector wins contested food independently of entity order', () =
     const game = setup(), p = game.player; place(p, 0, 0);
     const e = game.makeFlock(15, 0, 0, 0); e.invincible = 0; game.entities.push(e);
     if (reverse) game.entities.reverse();
-    game.addFood({ x: 14, y: 0 }, 4); game.collectFood(1 / 60);
+    game.addFood({ x: 14, y: 0 }, FLEET.enemySalvageCost); game.collectFood(1 / 60);
     assert.equal(e.boids.length, 1); assert.equal(game.xp, 0); assert.equal(game.food.length, 0);
   }
 });
@@ -175,9 +176,9 @@ test('body collectors can sweep food while their head stays away, for both sides
     const game = setup(), e = player ? game.player : game.makeFlock(0, 0, 0, 0);
     if (!player) { place(game.player, -900, -900); game.entities.push(e); }
     game.addBoid(e); place(e.boids[0], -90, 0);
-    game.addFood({ x: -90, y: 0 }, 4); game.collectFood(1 / 60);
-    assert.equal(e.boids.length, 2); assert.equal(game.food.length, 0);
-    assert.equal(game.xp, player ? 4 : 0);
+    game.addFood({ x: -90, y: 0 }, FLEET.enemySalvageCost); game.collectFood(1 / 60);
+    assert.equal(e.boids.length, player ? 1 : 2); assert.equal(game.food.length, 0);
+    assert.equal(game.xp, player ? FLEET.enemySalvageCost : 0);
   }
 });
 
@@ -187,7 +188,7 @@ test('food attraction takes time, can be intercepted, and counts value instead o
   assert.equal(game.xp, 0); assert.ok(game.food[0].x > 53 && game.food[0].x < 55);
   const e = game.makeFlock(54, 0, 0, 0); game.entities.push(e); game.collectFood(1 / 60);
   assert.equal(game.food.length, 0); assert.equal(game.xp, 0); assert.equal(e.boids.length, 0); assert.equal(e.growthProgress, 3);
-  game.addFood({ x: e.x, y: e.y }); game.collectFood(1 / 60); assert.equal(e.boids.length, 1);
+  game.addFood({ x: e.x, y: e.y }, FLEET.enemySalvageCost - 3); game.collectFood(1 / 60); assert.equal(e.boids.length, 1);
 });
 
 test('enemy growth respects the same flock cap and dead flocks cannot collect', () => {

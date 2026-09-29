@@ -65,6 +65,21 @@ test('speed opens the turning radius; gathering cannot bypass the yaw cap', () =
   assert.ok(Math.abs(gathered.turnRate) <= Math.abs(cruise.turnRate) + 1e-9);
 });
 
+test('a full base boost reaches twice the former top speed with its fleet and unchanged energy cost', () => {
+  const game = flight(); game.startPractice(); const p = game.player;
+  p.angle = 0; p.vx = p.speed; p.vy = 0;
+  for (const b of [p, ...p.boids]) { b.x -= 650; b.px = b.x; }
+  const count = p.boids.length;
+  for (let i = 0; i < 192; i++) game.update(1 / 60, { dx: 1, boost: true });
+  assert.equal(p.speed, 392);
+  assert.ok(Math.abs(game.energy - .8) < 1e-9, '3.2 seconds still costs 99.2 energy');
+  assert.equal(p.boids.length, count); assert.equal(game.strays.length, 0);
+  assert.ok(Math.abs(p.angle) < 1e-9, 'open straight flight should not be turned by the boundary');
+  const boostedSpeed = p.speed;
+  game.update(1 / 60, { dx: 1 });
+  assert.ok(p.speed < boostedSpeed && p.speed >= boostedSpeed - FLIGHT.braking / 60 - 1e-9);
+});
+
 test('rapid input alternation and boost transitions respect angular acceleration and speed limits', () => {
   for (const cohesion of [0, 5]) {
     const game = flight(cohesion), p = game.player;
@@ -94,7 +109,7 @@ test('the arena anticipates wide turns without teleporting or granting emergency
       game.update(1 / 60, { dx: 1, boost });
       farthest = Math.max(farthest, Math.hypot(p.x, p.y));
       assert.ok(Math.abs(p.turnRate - rate) <= FLIGHT.turnAcceleration / 60 + 1e-9);
-      assert.ok(Math.hypot(p.x - x, p.y - y) <= 196 / 60 + 1e-8);
+      assert.ok(Math.hypot(p.x - x, p.y - y) <= game.cruiseSpeed(p) * FLIGHT.boostMultiplier / 60 + 1e-8);
     }
     assert.ok(farthest < WORLD_RADIUS - 25, 'the path turns before reaching the boundary clamp');
   }

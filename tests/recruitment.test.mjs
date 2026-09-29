@@ -16,7 +16,7 @@ function escortScene(seed = 321) {
   player.boids = player.boids.slice(0, 12); player.invincible = 0;
   place(player, -800, 70);
   player.boids.forEach((b, i) => place(b, -835 - i % 4 * 18, 52 + Math.floor(i / 4) * 18));
-  const enemy = game.makeFlock(-500, 0, 0, 48);
+  const enemy = game.makeFlock(-500, 0, 0, 16);
   enemy.invincible = 0; enemy.speed = enemy.cruiseSpeed = 112;
   place(enemy, -500, 0);
   enemy.boids.forEach((b, i) => place(b, -535 - i % 7 * 15, -35 + Math.floor(i / 7) * 13));
@@ -91,11 +91,11 @@ test('an abandoned escort fully fades and changing rivals never carries over all
   assert.equal(bird.influenceTarget, player.id); assert.ok(bird.influence < .02);
 });
 
-test('12 naturally clustered birds recruit the outer tail of 64 through the full game loop', () => {
+test('4 naturally clustered drones recruit the outer tail of 12 through the full game loop', () => {
   const game = new Game(); game.startRecruitmentPractice();
   const player = game.player, enemy = game.entities.find(e => !e.player);
   const tail = enemy.boids.slice();
-  assert.equal(player.boids.length, 12); assert.equal(enemy.boids.length, 64);
+  assert.equal(player.boids.length, 4); assert.equal(enemy.boids.length, 12);
   assert.ok(game.entities.every(e => e.invincible === 0));
   assert.ok(tail.every(b => b.influence === 0 && b.owner === enemy.id));
   let first = null, visibleProgress = false;
@@ -104,7 +104,7 @@ test('12 naturally clustered birds recruit the outer tail of 64 through the full
     assert.equal(game.state, 'playing', 'ordinary head collisions remain enabled');
     visibleProgress ||= tail.some(b => b.influenceTarget === player.id && b.influence > .2 && b.influence < .9);
     if (first === null && game.recruitedFollowers) first = i / 60;
-    assert.equal(game.entities.reduce((n, e) => n + e.boids.length, game.strays.length), 76);
+    assert.equal(game.entities.reduce((n, e) => n + e.boids.length, game.strays.length), 16);
   }
   assert.ok(visibleProgress); assert.ok(first > 1.5 && first < 4, `first recruit: ${first}s`);
   assert.ok(tail.some(b => b.owner === player.id && player.boids.includes(b)));

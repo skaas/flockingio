@@ -1,33 +1,148 @@
-import { Game, WORLD_RADIUS, UPGRADES, TEMPERAMENTS, HEAD_GROWTH, headScaleForLevel, clamp, lerp, timeLabel } from './engine.mjs';
+import { Game, WORLD_RADIUS, TEMPERAMENTS, HEAD_GROWTH, headScaleForLevel, angleDelta, clamp, lerp, timeLabel } from './engine.mjs';
 import { Scenery } from './scenery.mjs';
+import { FIRE_SUPPORT, TARGET_NAMES, requestCoordinates, droneAttack, facilityDamage, facilityDurability } from './bombardment.mjs';
+import { drawGroundWar, drawBombs, drawAirDefense } from './battlefield-view.mjs';
+import { FLAK_PATTERN_LABELS } from './air-defense.mjs';
 import { RankingClient } from './ranking.mjs';
-import { normalizeNickname, validNickname, rankMode } from './identity.mjs';
+import { normalizeNickname, validNickname, suggestNickname, rankMode } from './identity.mjs';
+import { MouseFlightInput } from './mouse-input.mjs';
+import { ReplayRecorder, ReplayPlayer, REPLAY_STEP, seededRandom, validReplay, loadReplay, saveReplay } from './replay.mjs';
+import { GameAudio } from './audio.mjs';
+import { loadSprites, sprite } from './sprites.mjs';
+import { battleContribution, Memorial } from './legacy.mjs';
+
+loadSprites();
 
 const $ = id => document.getElementById(id);
 const viewport = $('viewport-shell');
 const canvas = $('world'), ctx = canvas.getContext('2d', { alpha: false });
 const map = $('minimap').getContext('2d');
-const colors = { lime: '#c9ed92', coral: '#f2957e', gold: '#e6c77f', aqua: '#80cec0' };
-const phases = ['고요한 수면', '낯선 물결', '사냥의 시작', '거친 흐름', '깊은 곳의 포식자', '마지막 물결'];
-const challengePhases = ['첫 사냥', '좁아지는 틈', '이어지는 추격', '거친 흐름', '포식자의 시간', '한계 너머'];
-const recordScore = seconds => Math.floor(seconds * 10 + 1e-7) / 10;
+// Tactical colour semantics: friendly = cyan, hostile = red, objective = amber, warning = gold.
+// Keys keep their historical names because the simulation emits them as effect ids.
+const colors = { lime: '#78dcea', coral: '#ff6a5c', gold: '#e6c77f', aqua: '#80cec0', amber: '#efbb77' };
+const phases = ['작전 구역 진입', '적 편대 포착', '요격 개시', '교전 확대', '중형 편대 접근', '최종 방어선'];
+const challengePhases = ['마지막까지 응답하라', '적 증원 확인', '요격망 확대', '전면 교전', '집중 공격', '한계 작전'];
+const pointsLabel = value => value.toLocaleString('ko-KR');
+// Tactical debrief remains available beneath the memorial.
+const END_REASONS = Object.freeze({
+  flak: '대공포 피격',
+  'head-on': '적 지휘기와 충돌',
+  tail: '적 드론과 충돌',
+});
 const recordLabel = seconds => { const tenths = Math.floor(seconds * 10 + 1e-7); return `${timeLabel(tenths / 10)}.${tenths % 10}`; };
 let width = innerWidth, height = innerHeight, dpr = 1, last = 0, accumulator = 0, visualTime = 0, hudTime = 0;
 let camera = { x: 0, y: 0, zoom: 1 };
 let cameraMotion = { x: 0, y: 0 };
 const scenery = new Scenery(WORLD_RADIUS + 650);
-let aim = null, mouseHeld = false, gatherHeld = false, gatherToggle = false, toastTimer = 0, lastDuration = Infinity, lastPractice = false, detachToastAt = -10, runBest = 0;
-const keys = new Set(), touches = new Map();
+let toastTimer = 0, lastDuration = Infinity, lastPractice = false, detachToastAt = -10, runBest = 0;
+const flightInput = new MouseFlightInput(canvas, { enabled: () => game.state === 'playing' && !replaying, point: localPointer });
 const leaderTrails = new WeakMap();
+const renderOrder = [], renderFactions = new Map();
 let activeModal = null, modalOrigin = null, helpOrigin = null, helpReturnToPause = false;
 const rankings = new RankingClient();
+let memorialStorage;
+try { memorialStorage = localStorage; } catch { /* A visit can still hold a memorial. */ }
+const memorial = new Memorial(memorialStorage, rankings.profile.playerId);
 let currentRun = null, starting = false, rankingReturn = null, rankingOrigin = null, rankingRequest = 0;
+let rankingTab = 'ranking', rankingCount = '';
+let recorder = null, replayPlayer = null, latestReplay = null, activeReplay = null, replaying = false, lastEndReason = null;
 let rankingRetryTimer = null, rankingRetryDelay = 3000;
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+// Screen effects are presentation only: they never read or advance the seeded simulation.
+const fxFlash = $('fx-flash'), fxSignal = $('fx-signal'), fxNoise = $('fx-noise').getContext('2d');
+let shakeTime = 0, shakeAmp = 0, signalTimer = 0, signalDone = null;
+const SHAKE_SECONDS = .28, SIGNAL_SECONDS = .5;
+function blast(x, y, strength) {
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !game.player) return;
+  const near = Math.max(0, 1 - Math.hypot(x - game.player.x, y - game.player.y) / 260) * strength;
+  if (near < .05) return;
+  if (!reducedMotion) { shakeAmp = Math.max(shakeTime > 0 ? shakeAmp : 0, 7 * near); shakeTime = SHAKE_SECONDS; }
+  fxFlash.style.setProperty('--fx-x', `${(x - camera.x) * camera.zoom + width / 2}px`);
+  fxFlash.style.setProperty('--fx-y', `${(y - camera.y) * camera.zoom + height / 2}px`);
+  fxFlash.animate?.([{ opacity: (reducedMotion ? .2 : .55) * near }, { opacity: 0 }], { duration: 320, easing: 'ease-out' });
+}
+// A shoot-down plays as one scene: see the hit, watch the feed degrade, then read the
+// debrief over the recovered last frame. Residual static stays until the next sortie.
+const FEED_IMPACT = .35, FEED_DEGRADE = .55, FEED_LINK = .25;
+const fxHit = $('fx-hit'), fxLabel = $('fx-signal').querySelector('span');
+let feed = null, noiseClock = 0;
+function signalLoss(then) {
+  const p = game.player;
+  blast(p.x, p.y, 1.3);
+  fxHit.style.left = `${(p.x - camera.x) * camera.zoom + width / 2}px`;
+  fxHit.style.top = `${(p.y - camera.y) * camera.zoom + height / 2}px`;
+  fxHit.hidden = false; fxHit.getAnimations?.().forEach(animation => animation.cancel());
+  fxHit.classList.remove('struck'); void fxHit.offsetWidth; fxHit.classList.add('struck');
+  feed = { phase: 'impact', t: 0, done: then };
+  if (reducedMotion) finishFeedLoss();
+}
+function showFeedPhase(phase, label) {
+  fxSignal.dataset.phase = phase; fxSignal.hidden = false;
+  if (label) fxLabel.textContent = label;
+}
+function finishFeedLoss() {
+  if (!feed || feed.phase === 'residual') return;
+  const done = feed.done;
+  feed = { phase: 'residual', t: 0 };
+  canvas.classList.add('feed-lost'); document.body.classList.add('feed-down'); showFeedPhase('residual');
+  fxSignal.style.setProperty('--noise', 1);
+  done?.();
+}
+function cancelSignal() {
+  feed = null; fxSignal.hidden = true; fxHit.hidden = true; fxHit.classList.remove('struck');
+  canvas.classList.remove('feed-lost'); document.body.classList.remove('feed-down'); fxSignal.style.setProperty('--noise', 0);
+}
+// Retrying reconnects the feed instead of cutting straight to a clean picture.
+function linkFeed() {
+  if (reducedMotion) return;
+  feed = { phase: 'link', t: 0 }; fxSignal.style.setProperty('--noise', 1);
+  showFeedPhase('link', '신호 연결'); sound.play('signalLink');
+}
+function skipFeed(event) {
+  if (feed?.phase !== 'impact' && feed?.phase !== 'degrade') return;
+  if (event.type === 'keydown' && !['Enter', ' ', 'Escape'].includes(event.key)) return;
+  event.preventDefault(); event.stopPropagation(); finishFeedLoss();
+}
+addEventListener('pointerdown', skipFeed, true);
+addEventListener('keydown', skipFeed, true);
+function drawNoise(tear = true) {
+  const image = fxNoise.createImageData(160, 90), data = image.data, band = Math.random() * 90;
+  for (let i = 0; i < data.length; i += 4) {
+    const row = (i >> 2) / 160 | 0, v = Math.random() * (tear && Math.abs(row - band) < 5 ? 255 : 150);
+    data[i] = v * .85; data[i + 1] = v; data[i + 2] = v * .9; data[i + 3] = 255;
+  }
+  fxNoise.putImageData(image, 0, 0);
+}
+function updateEffects(dt) {
+  if (shakeTime > 0) {
+    shakeTime = Math.max(0, shakeTime - dt);
+    const k = shakeAmp * shakeTime / SHAKE_SECONDS;
+    canvas.style.transform = k > .15 ? `translate(${((Math.random() * 2 - 1) * k).toFixed(1)}px, ${((Math.random() * 2 - 1) * k).toFixed(1)}px)` : '';
+  }
+  if (!feed) return;
+  feed.t += dt;
+  if (feed.phase === 'impact' && feed.t >= FEED_IMPACT) {
+    feed.phase = 'degrade'; feed.t = 0;
+    canvas.classList.add('feed-lost'); document.body.classList.add('feed-down');
+    showFeedPhase('degrade', '신호 두절'); sound.play('signalLost');
+  }
+  if (feed.phase === 'degrade') {
+    fxSignal.style.setProperty('--noise', Math.min(1, feed.t / FEED_DEGRADE).toFixed(3));
+    drawNoise();
+    if (feed.t >= FEED_DEGRADE) finishFeedLoss();
+  } else if (feed.phase === 'residual') {
+    // A slow residual shimmer: enough to read as a lost feed, never enough to distract.
+    noiseClock += dt;
+    if (noiseClock > .09 && !reducedMotion) { noiseClock = 0; drawNoise(false); }
+  } else if (feed.phase === 'link') {
+    fxSignal.style.setProperty('--noise', Math.max(0, 1 - feed.t / FEED_LINK).toFixed(3));
+    drawNoise();
+    if (feed.t >= FEED_LINK) cancelSignal();
+  }
+}
 const readStorage = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
 const saveStorage = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* Private browsing can disable storage. */ } };
-const readBest = key => { const value = readStorage(key, 0); return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0; };
-let soundEnabled = readStorage('murmur-sound', false), audio = null, lastChirp = 0;
+const sound = new GameAudio({ ...readStorage('murmur-audio', {}), enabled: readStorage('murmur-sound', true) });
 
 function resize() {
   const bounds = viewport.getBoundingClientRect();
@@ -38,28 +153,52 @@ function resize() {
 }
 addEventListener('resize', resize); resize();
 
-function playTone(frequency = 440, length = .1, volume = .04, type = 'sine', slide = 1) {
-  if (!soundEnabled) return;
-  try {
-    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
-    if (audio.state === 'suspended') audio.resume();
-    const osc = audio.createOscillator(), gain = audio.createGain();
-    osc.type = type; osc.frequency.setValueAtTime(frequency, audio.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(frequency * slide, audio.currentTime + length);
-    gain.gain.setValueAtTime(volume, audio.currentTime); gain.gain.exponentialRampToValueAtTime(.0001, audio.currentTime + length);
-    osc.connect(gain); gain.connect(audio.destination); osc.start(); osc.stop(audio.currentTime + length);
-  } catch { /* Sound is optional; the game remains playable without Web Audio. */ }
-}
 function updateSound() {
+  const soundEnabled = sound.settings.enabled;
   $('sound').setAttribute('aria-label', soundEnabled ? '소리 끄기' : '소리 켜기');
   $('sound').title = soundEnabled ? '소리 끄기' : '소리 켜기';
   $('sound').setAttribute('aria-pressed', String(soundEnabled));
   $('sound').querySelector('.sound-slash').style.display = soundEnabled ? 'none' : '';
+  for (const button of document.querySelectorAll('.sound-toggle')) {
+    button.textContent = soundEnabled ? '소리 켜짐' : '소리 꺼짐';
+    button.setAttribute('aria-pressed', String(soundEnabled));
+  }
+  for (const slider of document.querySelectorAll('[data-volume]')) {
+    const value = Math.round(sound.settings[slider.dataset.volume] * 100);
+    slider.value = value; slider.nextElementSibling.value = `${value}%`;
+  }
 }
-$('sound').addEventListener('click', () => { soundEnabled = !soundEnabled; saveStorage('murmur-sound', soundEnabled); updateSound(); playTone(520); }); updateSound();
+function saveSound(patch) {
+  sound.configure(patch);
+  saveStorage('murmur-sound', sound.settings.enabled); saveStorage('murmur-audio', sound.settings);
+  updateSound();
+}
+for (const button of [$('sound'), ...document.querySelectorAll('.sound-toggle')]) {
+  button.addEventListener('click', () => { saveSound({ enabled: !sound.settings.enabled }); sound.play('ui'); });
+}
+for (const slider of document.querySelectorAll('[data-volume]')) {
+  slider.addEventListener('input', () => saveSound({ [slider.dataset.volume]: Number(slider.value) / 100 }));
+  slider.addEventListener('change', () => { if (slider.dataset.volume === 'effects') sound.play('ui'); });
+}
+// Unlock synchronously on a real gesture, before nickname registration awaits the server.
+addEventListener('pointerdown', () => sound.unlock(), { capture: true });
+document.addEventListener('click', event => {
+  if (event.target.closest?.('button, summary') && !event.target.closest('#sound, .sound-toggle')) sound.play('ui');
+});
+updateSound();
 
-function toast(message, duration = 3.4) { $('toast').textContent = message; $('toast').classList.add('visible'); toastTimer = duration; }
-function resetInput() { keys.clear(); mouseHeld = false; gatherHeld = false; gatherToggle = false; touches.clear(); aim = null; $('gather').setAttribute('aria-pressed', 'false'); }
+// The game may emit events while it is still being constructed.
+const missionClock = () => { try { return game.elapsed || 0; } catch { return 0; } };
+// Messages arrive as radio traffic: mission clock, sender callsign, brevity text.
+// The sender's colour follows the tactical semantics (friendly, hostile, objective).
+function toast(message, duration = 3.4, from = '관제', tone = 'friendly') {
+  const element = $('toast'), stamp = document.createElement('span'), sender = document.createElement('span');
+  stamp.className = 'radio-stamp'; stamp.textContent = timeLabel(missionClock());
+  sender.className = 'radio-from'; sender.textContent = `${from} ▸`;
+  element.dataset.tone = tone; element.replaceChildren(stamp, sender, document.createTextNode(message));
+  element.classList.add('visible'); toastTimer = duration;
+}
+function resetInput() { flightInput.reset(); }
 function localPointer(event) {
   const bounds = viewport.getBoundingClientRect();
   return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
@@ -100,134 +239,218 @@ function iconSVG(id) {
     alignment: '<path d="m8 14 15 0m-5-5 5 5-5 5M14 26h27m-5-5 5 5-5 5M8 38h22m-5-5 5 5-5 5"/>',
     magnet: '<circle cx="25" cy="25" r="6"/><circle cx="25" cy="25" r="14" stroke-dasharray="3 6"/><path d="M25 3v8m0 28v8M3 25h8m28 0h8"/>',
     growth: '<circle cx="25" cy="25" r="7"/><circle cx="12" cy="12" r="4"/><circle cx="38" cy="12" r="4"/><circle cx="12" cy="38" r="4"/><circle cx="38" cy="38" r="4"/><path d="m16 16 4 4m10 10 4 4m0-18-4 4M20 30l-4 4"/>',
+    bombing: '<path d="m17 8 8 8 8-8M25 16v9m-7 0h14v8a7 7 0 0 1-14 0zM13 43h24M25 40v6"/>',
     boost: '<path d="M28 4 12 28h12l-2 18 17-26H27z"/>',
   };
   return `<svg class="upgrade-icon" viewBox="0 0 50 50" aria-hidden="true">${paths[id]}</svg>`;
 }
 function showUpgrades() {
   const scale = headScaleForLevel(game.level);
-  $('upgrade-description').textContent = `시간은 멈춰 있어요. ${game.player.radius < game.player.growthTargetRadius ? `대장이 ${Number(scale.toFixed(1))}배로 커지고, 더 빨라져요.` : '대장은 최대 크기예요.'} 무리를 키울 힘을 골라주세요.`;
+  $('upgrade-description').textContent = `일시정지 · 지휘기 ${Number(scale.toFixed(1))}배${game.player.radius < game.player.growthTargetRadius ? '로 확장 · 속도 증가' : ''}`;
   $('upgrade-cards').replaceChildren();
   game.choices.forEach((upgrade, index) => {
     const button = document.createElement('button'); button.className = 'upgrade-card';
-    const effect = upgrade.id === 'boost' ? '더 오래 가속할 수 있어요.' : upgrade.effect;
-    button.innerHTML = `<span class="card-index desktop-copy" aria-hidden="true">${index + 1}</span>${iconSVG(upgrade.icon)}<h3>${upgrade.name}</h3><span class="card-level">선택 시 ${game.stats[upgrade.id] + 1} / ${upgrade.max}단계</span><div class="card-description">${upgrade.description} ${effect}</div>`;
-    button.addEventListener('click', () => { resetInput(); game.chooseUpgrade(index); });
+    const effect = upgrade.id === 'boost' ? '더 오래 가속할 수 있습니다.' : upgrade.effect;
+    const description = upgrade.id === 'bombing'
+      ? `드론당 공격력<strong class="upgrade-damage">${droneAttack(game.stats.bombing)} → ${droneAttack(game.stats.bombing + 1)}</strong>`
+      : upgrade.id === 'growth'
+      ? `드론 수<strong class="upgrade-damage">${game.player.boids.length} → ${Math.min(game.flockLimit, game.player.boids.length + 2)}기</strong>`
+      : `${upgrade.description} ${effect}`;
+    button.innerHTML = `${iconSVG(upgrade.icon)}<h3>${upgrade.name}</h3><span class="card-level">선택 시 ${game.stats[upgrade.id] + 1} / ${upgrade.max}단계</span><div class="card-description">${description}</div>`;
+    button.addEventListener('click', () => chooseUpgrade(index));
     $('upgrade-cards').append(button);
   });
   showModal('upgrade-modal');
 }
 function onEvent(event) {
-  if (event.type === 'start') { toast(event.practice === 'recruitment' ? '내 12마리 vs 적 64마리 · 꼬리 끝을 노려보세요' : event.practice ? '적 없는 자유 비행 · 결집과 가속을 시험해 보세요' : event.challenge ? `작은 적을 먼저 노리세요 · 진화 에너지 ${game.nextXp}을 모아보세요` : '머리를 지키고, 적의 잔해를 모으세요', 4); playTone(220, .4, .035, 'sine', 2); }
-  if (event.type === 'food' && visualTime - lastChirp > .12) { lastChirp = visualTime; playTone(620 + game.collected % 5 * 90, .085, .012); }
-  if (event.type === 'kill') { toast(`적 군체 해체 · 남은 먹이를 흡수하세요`); playTone(140, .3, .04, 'triangle', 2.8); }
-  if (event.type === 'sway') { toast('동료가 흔들려요 · 가까이 돌아가 결집하세요', 4); playTone(230, .3, .025, 'triangle', .75); }
+  sound.handle(event, game);
+  if (event.type === 'flak-impact') blast(event.x, event.y, 1);
+  if (event.type === 'bomb-impact') blast(event.x ?? event.request?.x, event.y ?? event.request?.y, .45);
+  if (event.type === 'start') {
+    if (replaying) toast('마지막 출격', 4, '기록', 'system');
+    else if (event.practice) toast(event.practice === 'recruitment' ? '아군 4기 대 적 12기. 적 후방 드론을 확보하라.' : '적 없음. 결집과 가속을 시험하라.', 4, '교관', 'system');
+    else if (event.challenge) toast(`출격 확인. 첫 요청 좌표 ${requestCoordinates(game.bombardment.requests[0])}.`, 4, '관제', 'objective');
+  }
+  if (event.type === 'strike-request') { toast(`새 요청. 좌표 ${requestCoordinates(event.request)}, ${TARGET_NAMES[event.request.kind]}.`, 3.5, '관제', 'objective'); }
+  if (event.type === 'strike-start') { toast('목표 진입. 폭격 개시.', 3, '편대', 'friendly'); }
+  if (event.type === 'interception') { toast('적 요격 편대 접근. 드론을 엄호하라.', 3, '경보', 'hostile'); }
+  if (event.type === 'strike-complete') { toast(`좌표 ${requestCoordinates(event.request)} 제압.`, 4, '편대', 'friendly'); }
+  if (event.type === 'kill') { toast('적 지휘기 격추. 잔해를 회수하라.', 3.4, '편대', 'friendly'); }
+  if (event.type === 'sway') { toast('통신 교란 감지. 결집해 연결을 유지하라.', 4, '경보', 'hostile'); }
   if (event.type === 'allegiance') {
-    toast(event.lost ? `동료 ${event.lost}마리가 적 군체로 넘어갔습니다` : `새 동료 ${event.gained}마리가 우리 군체에 합류했습니다`, 4);
-    playTone(event.lost ? 180 : 480, .18, .014, 'sine', event.lost ? .7 : 1.4);
+    toast(event.lost ? `드론 ${event.lost}기 통제권 상실.` : `드론 ${event.gained}기 합류.`, 4, event.lost ? '경보' : '편대', event.lost ? 'hostile' : 'friendly');
   }
   if (event.type === 'detached' && visualTime - detachToastAt > 3) {
     detachToastAt = visualTime;
-    toast('동료가 떨어졌어요 · 가까이 함께 날면 다시 합류해요', 4);
+    toast('드론 연결 끊김. 가까이 붙어 재연결하라.', 4, '편대', 'hostile');
   }
-  if (event.type === 'phase') { toast(`${(game.challenge ? challengePhases : phases)[event.phase]} · 더 강한 군체가 다가옵니다`, 3); playTone(140, .5, .045, 'sine', .6); }
-  if (event.type === 'evolution-ready') { updateHUD(); toast('진화 준비 완료 · 아래의 진화하기를 눌러주세요', 4); playTone(420, .18, .025, 'sine', 1.5); }
-  if (event.type === 'upgrade') { resetInput(); showUpgrades(); playTone(420, .25, .03, 'sine', 2); }
-  if (event.type === 'evolved') { showModal(null); toast(`진화 완료 · ${event.upgrade.name} ${game.stats[event.upgrade.id]}단계`); updateBehavior(); updateHUD(); playTone(650, .3, .025, 'sine', 1.5); }
+  if (event.type === 'phase') { toast(`${(game.challenge ? challengePhases : phases)[event.phase]}. 적 전력 증강.`, 3, '정보', 'hostile'); }
+  if (event.type === 'evolution-ready') { updateHUD(); toast('개량 준비 완료. 하단 버튼으로 진행.', 4, '정비', 'friendly'); }
+  if (event.type === 'upgrade') { if (!replaying) { resetInput(); showUpgrades(); } }
+  if (event.type === 'evolved') { if (!replaying) showModal(null); toast(`${event.upgrade.name} ${game.stats[event.upgrade.id]}단계 장착 완료.`, 3.4, '정비', 'friendly'); updateBehavior(); updateHUD(); }
   if (event.type === 'pause') { resetInput(); updateHUD(); showModal('pause-modal'); }
   if (event.type === 'resume') { resetInput(); showModal(null); }
-  if (event.type === 'mastery') { resetInput(); updateHUD(); toast('진화 완료 · 가속 에너지를 채웠어요'); }
+  if (event.type === 'mastery') { resetInput(); updateHUD(); toast('가속 에너지 재충전 완료.', 3.4, '정비', 'friendly'); }
   if (event.type === 'end') {
+    lastEndReason = event.reason;
+    if (replaying) return; // The player verifies the last frame before showing the result.
     resetInput();
-    const key = game.challenge ? 'murmur-challenge-best' : game.duration === 1800 ? 'murmur-best' : 'murmur-quick-best';
-    const best = readBest(key), score = game.challenge ? recordScore(game.elapsed) : game.elapsed, newRecord = !game.practice && score > best;
-    if (!game.practice) saveStorage(key, Math.max(best, score));
-    $('end-title').textContent = event.won ? '우리는 살아남았다.' : game.challenge && newRecord ? '조금 더, 멀리.' : '한 번 더, 날아볼까요.';
-    $('end-reason').textContent = event.won ? `${game.duration === 1800 ? '30분의 생존' : '3분의 탐색'}을 마쳤습니다. 함께였기에 가능했어요.` : event.reason === 'head-on' ? '대장끼리 부딪혀 둘 다 쓰러졌습니다.' : '머리가 적의 꼬리에 닿았습니다. 다음엔 더 큰 흐름으로.';
-    $('end-time').textContent = game.challenge ? recordLabel(game.elapsed) : timeLabel(game.elapsed); $('end-flock').textContent = `${game.maxFlock}마리`; $('end-kills').textContent = game.kills;
-    $('end-record').hidden = Boolean(game.practice);
-    $('end-record').textContent = newRecord ? best ? `새 기록 · 이전보다 ${recordLabel(score - best)} 더 생존` : `첫 기록 ${game.challenge ? recordLabel(score) : timeLabel(score)}` : `최고 기록 ${game.challenge ? recordLabel(best) : timeLabel(best)}`;
-    $('build-summary').textContent = UPGRADES.filter(u => game.stats[u.id]).map(u => `${u.name} ${game.stats[u.id]}단계`).join(' · ');
+    const contribution = battleContribution(game), best = memorial.data.best;
+    const newRecord = !game.practice && contribution.score > best;
+    const heroName = currentRun?.heroName || rankings.profile.nickname;
+    $('end-modal').dataset.outcome = event.won ? 'won' : 'lost';
+    $('end-eyebrow').textContent = game.practice ? '훈련 종료' : event.won ? '출격 완료' : '전사';
+    $('end-title').textContent = heroName;
+    $('end-feed').hidden = Boolean(event.won);
+    $('end-reason').textContent = event.won ? '출격 완료' : END_REASONS[event.reason] ?? END_REASONS.tail;
+    renderContribution(contribution);
+    if (!game.practice && !event.won && currentRun) {
+      memorial.record({ runId: currentRun.runId, name: heroName, elapsed: game.elapsed, ...contribution });
+      updateRecord();
+    }
+    $('end-record').hidden = !newRecord;
+    $('end-record').classList.toggle('is-new', newRecord);
+    $('end-record').textContent = newRecord ? '최고 기여도 갱신' : '';
+    $('build-summary').textContent = game.upgrades.filter(u => game.stats[u.id]).map(u => `${u.name} ${game.stats[u.id]}단계`).join(' · ');
     $('build-summary').hidden = !$('build-summary').textContent;
-    $('rank-result').hidden = Boolean(game.practice);
+    $('build-details').hidden = false;
+    $('build-details').open = false;
+    $('rank-result').hidden = Boolean(game.practice) || !currentRun;
     $('rank-end').hidden = Boolean(game.practice);
-    if (!game.practice && currentRun) saveFinishedRun();
-    showModal('end-modal'); playTone(event.won ? 400 : 160, .7, .04, 'sine', event.won ? 2 : .3);
+    $('replay-button').hidden = true;
+    if (!game.practice && currentRun) $('rank-result').textContent = '기록 중';
+    if (event.won) showModal('end-modal');
+    else signalLoss(() => { if (game.state === 'ended' && !replaying) showModal('end-modal'); });
   }
 }
 const game = new Game({ onEvent });
 
-function updateIdentity() {
-  const nickname = normalizeNickname($('nickname').value);
-  $('player-identity').textContent = nickname ? `${nickname}#${rankings.profile.tag}${rankings.persistent ? ' · 이 브라우저에서 기억해요' : ' · 이번 방문에만 기억해요'}` : '이름이 같아도 고유번호로 구분해요.';
-}
+
+if (!validNickname(rankings.profile.nickname)) rankings.setNickname(suggestNickname());
 $('nickname').value = rankings.profile.nickname;
-$('nickname').addEventListener('input', () => { $('nickname').setCustomValidity(''); $('nickname-error').hidden = true; updateIdentity(); });
-updateIdentity();
+$('nickname').addEventListener('input', () => { $('nickname').setCustomValidity(''); $('nickname-error').hidden = true; });
+$('shuffle-nickname').addEventListener('click', () => {
+  rankings.setNickname(suggestNickname(normalizeNickname($('nickname').value)));
+  $('nickname').value = rankings.profile.nickname;
+  $('nickname').setCustomValidity(''); $('nickname-error').hidden = true;
+  $('nickname').focus({ preventScroll: true });
+});
 
 async function beginRun(duration, practice = false) {
   if (starting) return;
   const nickname = normalizeNickname($('nickname').value);
   if (!validNickname(nickname)) {
-    $('nickname').setCustomValidity('닉네임을 1~16자로 입력해주세요.');
-    $('nickname').reportValidity(); $('nickname').focus(); return;
+    const message = '이름을 1~16자로 입력하세요.';
+    $('nickname').setCustomValidity(message); $('nickname-error').textContent = message; $('nickname-error').hidden = false;
+    $('nickname').reportValidity(); $('nickname').focus({ preventScroll: true }); return;
   }
-  rankings.setNickname(nickname); $('nickname').value = nickname; updateIdentity();
+  rankings.setNickname(nickname); $('nickname').value = nickname;
   starting = true; $('start').disabled = true; $('start-form').setAttribute('aria-busy', 'true');
   $('start').firstChild.textContent = '준비 중… '; $('home').inert = true; $('topbar').inert = true;
   try { await rankings.register(); rankings.flush().catch(() => {}); }
   catch { /* Completed offline runs are queued for automatic retry. */ }
   finally {
     starting = false; $('start').disabled = false; $('start-form').removeAttribute('aria-busy');
-    $('start').firstChild.textContent = '플레이 '; $('home').inert = false; $('topbar').inert = false;
-    updateIdentity(); start(duration, practice);
+    $('start').firstChild.textContent = '출격 '; $('home').inert = false; $('topbar').inert = false;
+    start(duration, practice);
   }
 }
 
-async function saveFinishedRun() {
+async function saveFinishedRun(replay) {
   const runId = currentRun.runId;
-  const score = { ...currentRun, elapsedMs: Math.floor(game.elapsed * 10 + 1e-7) * 100, maxFlock: game.maxFlock, kills: game.kills };
-  const playerLabel = rankings.label;
-  $('rank-result').textContent = `${playerLabel} · 랭킹에 등록하는 중…`;
+  const score = { ...currentRun, elapsedMs: Math.floor(game.elapsed * 10 + 1e-7) * 100, maxFlock: game.maxFlock, kills: game.kills, completed: game.bombardment.completed };
+  $('rank-result').textContent = '기록 중';
   try {
-    const result = await rankings.submit(score);
-    if (currentRun?.runId === runId && game.state === 'ended') $('rank-result').textContent = `${playerLabel} · ${result.own.rank}위${result.newBest ? ' · 최고 기록 등록' : ' · 기존 최고 기록 유지'}`;
+    const result = await rankings.submit(score, replay);
+    if (currentRun?.runId === runId && game.state === 'ended') $('rank-result').textContent = `최고 기여도 ${result.own.rank}위`;
   } catch {
-    if (currentRun?.runId === runId && game.state === 'ended') $('rank-result').textContent = '랭킹 등록 대기 중 · 연결되면 자동으로 다시 시도해요.';
+    if (currentRun?.runId === runId && game.state === 'ended') $('rank-result').textContent = '연결되면 기록 저장';
     scheduleRankingRetry();
   }
 }
 
-function rankingRow(entry) {
-  const row = document.createElement('li'); row.className = 'ranking-row';
-  row.classList.toggle('is-me', entry.playerId === rankings.profile.playerId);
-  const place = document.createElement('span'); place.className = 'rank-place'; place.textContent = entry.rank;
-  const name = document.createElement('span'); name.className = 'rank-name'; name.textContent = entry.nickname;
-  const tag = document.createElement('small'); tag.textContent = `#${entry.tag}${entry.playerId === rankings.profile.playerId ? ' · 나' : ''}`; name.append(tag);
-  const time = document.createElement('span'); time.className = 'rank-time'; time.textContent = recordLabel(entry.elapsedMs / 1000);
-  row.append(place, name, time); return row;
+async function playRankedReplay(entry, mode, button) {
+  button.disabled = true; setRankingStatus('출격 기록 불러오는 중…');
+  const request = rankingRequest;
+  try {
+    const { replay } = await rankings.replay(entry.playerId, mode);
+    if (request !== rankingRequest) return;
+    if (!validReplay(replay)) throw new Error('출격 기록을 재생할 수 없습니다.');
+    startPlayback(replay);
+  } catch (error) {
+    if (request === rankingRequest) setRankingStatus(error.message || '출격 기록을 불러올 수 없습니다.');
+  } finally { button.disabled = false; }
+}
+function rankCell(value, className = '') {
+  const cell = document.createElement('td'); cell.className = className; cell.textContent = value;
+  return cell;
+}
+function rankingRow(entry, mode) {
+  const row = document.createElement('tr'); row.className = 'ranking-row'; row.dataset.rank = entry.rank;
+  const isMe = entry.playerId === rankings.profile.playerId;
+  row.classList.toggle('is-me', isMe);
+  const name = rankCell('', 'rank-name'), label = document.createElement('span');
+  label.textContent = entry.nickname; label.title = `${entry.nickname}#${entry.tag}`;
+  const identifier = document.createElement('span'); identifier.className = 'sr-only'; identifier.textContent = ` #${entry.tag}`;
+  name.append(label, identifier);
+  if (isMe) { const badge = document.createElement('span'); badge.className = 'rank-me'; badge.textContent = '나'; name.append(badge); }
+  row.append(rankCell(String(entry.rank).padStart(2, '0'), 'rank-place'), name,
+    rankCell(entry.completed ?? '—', 'rank-objectives'), rankCell(entry.kills, 'rank-kills'),
+    rankCell(recordLabel(entry.elapsedMs / 1000), 'rank-duration'),
+    rankCell(entry.completed == null ? '이전 기록' : pointsLabel(entry.contribution), 'rank-score'));
+  const replay = rankCell('', 'rank-watch');
+  if (entry.hasReplay) {
+    const watch = document.createElement('button'); watch.className = 'rank-replay';
+    watch.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7 4 9 6-9 6z"/></svg>';
+    watch.title = '마지막 출격 다시 보기'; watch.setAttribute('aria-label', `${entry.nickname}#${entry.tag} 마지막 출격 다시 보기`);
+    watch.addEventListener('click', () => playRankedReplay(entry, mode, watch)); replay.append(watch);
+  } else { replay.textContent = '—'; replay.setAttribute('aria-label', '재생 기록 없음'); }
+  row.append(replay);
+  return row;
+}
+function setRankingStatus(message = '') {
+  $('ranking-status').textContent = message;
+  $('ranking-status').hidden = !message;
+}
+function selectRankingTab(tab) {
+  rankingTab = tab;
+  for (const name of ['ranking', 'memorial']) {
+    const selected = name === tab;
+    $(`${name}-tab`).setAttribute('aria-selected', String(selected));
+    $(`${name}-tab`).tabIndex = selected ? 0 : -1;
+  }
+  $('ranking-board').hidden = tab !== 'ranking';
+  $('memorial').hidden = tab !== 'memorial';
+  $('refresh-ranking').hidden = tab !== 'ranking';
+  $('ranking-count').textContent = tab === 'ranking' ? rankingCount : '';
 }
 async function refreshRanking() {
-  const request = ++rankingRequest, mode = $('ranking-mode').value;
-  $('ranking-status').textContent = '랭킹을 불러오는 중이에요.';
+  const request = ++rankingRequest, mode = 'challenge';
+  setRankingStatus('불러오는 중…'); rankingCount = '';
+  $('ranking-count').textContent = '';
   $('ranking-list').replaceChildren(); $('my-ranking').hidden = true; $('refresh-ranking').disabled = true;
+  $('ranking-board').setAttribute('aria-busy', 'true');
   try {
     await rankings.flush().catch(() => {});
     const result = await rankings.list(mode);
     if (request !== rankingRequest) return;
-    $('ranking-status').textContent = result.entries.length ? `${result.total}명의 최고 기록${rankings.pending.size ? ' · 내 기록은 등록 대기 중' : ''}` : '아직 기록이 없어요. 첫 번째로 이름을 남겨보세요.';
-    $('ranking-list').replaceChildren(...result.entries.map(rankingRow));
+    rankingCount = `전체 ${pointsLabel(result.total)}명`;
+    if (rankingTab === 'ranking') $('ranking-count').textContent = rankingCount;
+    setRankingStatus(result.entries.length ? rankings.pending.size ? '내 기록 등록 대기 중' : '' : '등록된 전쟁 기여도 없음');
+    $('ranking-list').replaceChildren(...result.entries.map(entry => rankingRow(entry, mode)));
     if (result.own && !result.entries.some(entry => entry.playerId === result.own.playerId)) {
-      const label = document.createElement('p'); label.textContent = '내 최고 기록';
-      const list = document.createElement('ol'); list.className = 'ranking-list'; list.append(rankingRow(result.own));
-      $('my-ranking').replaceChildren(label, list); $('my-ranking').hidden = false;
+      const table = document.createElement('table'); table.className = 'ranking-table'; table.setAttribute('aria-label', '내 기여도 순위');
+      const body = document.createElement('tbody'); body.append(rankingRow(result.own, mode)); table.append(body);
+      $('my-ranking').replaceChildren(table); $('my-ranking').hidden = false;
     }
-  } catch { if (request === rankingRequest) $('ranking-status').textContent = '랭킹에 연결할 수 없어요. 새로고침으로 다시 시도해주세요.'; }
-  finally { if (request === rankingRequest) $('refresh-ranking').disabled = false; }
+  } catch { if (request === rankingRequest) setRankingStatus('연결 실패 · 새로고침으로 다시 시도'); }
+  finally {
+    if (request === rankingRequest) { $('refresh-ranking').disabled = false; $('ranking-board').setAttribute('aria-busy', 'false'); }
+  }
 }
 function openRanking() {
   rankingReturn = activeModal; rankingOrigin = document.activeElement;
-  $('ranking-mode').value = game.state === 'ended' ? currentRun?.mode || 'challenge' : 'challenge';
+  updateRecord(); selectRankingTab('ranking');
   showModal('ranking-modal'); refreshRanking();
 }
 function closeRanking() {
@@ -235,8 +458,18 @@ function closeRanking() {
   if (rankingReturn) requestAnimationFrame(() => { if (activeModal === rankingReturn) rankingOrigin?.focus({ preventScroll: true }); });
 }
 $('rank-home').addEventListener('click', openRanking); $('rank-end').addEventListener('click', openRanking);
-$('close-ranking').addEventListener('click', closeRanking); $('ranking-mode').addEventListener('change', refreshRanking);
+$('close-ranking').addEventListener('click', closeRanking);
 $('refresh-ranking').addEventListener('click', refreshRanking);
+for (const name of ['ranking', 'memorial']) {
+  $(`${name}-tab`).addEventListener('click', () => selectRankingTab(name));
+  $(`${name}-tab`).addEventListener('keydown', event => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === 'Home' ? 'ranking' : event.key === 'End' ? 'memorial' : name === 'ranking' ? 'memorial' : 'ranking';
+    selectRankingTab(next); $(`${next}-tab`).focus();
+  });
+}
+
 function scheduleRankingRetry() {
   if (rankingRetryTimer || !rankings.pending.size) return;
   rankingRetryTimer = setTimeout(() => { rankingRetryTimer = null; retryRanking(); }, rankingRetryDelay);
@@ -246,63 +479,160 @@ async function retryRanking() {
   try {
     await rankings.flush(); rankingRetryDelay = 3000;
     const result = rankings.results.get(currentRun?.runId);
-    if (result && game.state === 'ended') $('rank-result').textContent = `${rankings.label} · ${result.own.rank}위 · 등록 완료`;
+    if (result && game.state === 'ended') $('rank-result').textContent = `최고 기여도 ${result.own.rank}위`;
   } catch { scheduleRankingRetry(); }
 }
 addEventListener('online', retryRanking);
 if (rankings.pending.size && validNickname(rankings.profile.nickname)) retryRanking();
 
 function updateBehavior() {
-  $('behavior-stats').innerHTML = UPGRADES.filter(u => game.stats[u.id]).map(u => `<div class="behavior"><span>${u.name}</span><small>${game.stats[u.id]} / ${u.max}단계</small></div>`).join('') || '<div class="empty-build">잔해를 모으면 새 능력을 고를 수 있어요.</div>';
+  $('behavior-stats').innerHTML = game.upgrades.filter(u => game.stats[u.id]).map(u => `<div class="behavior"><span>${u.name}</span><small>${game.stats[u.id]} / ${u.max}단계</small></div>`).join('') || '<div class="empty-build">개량 장비 없음</div>';
 }
-function start(duration, practice = false) {
-  currentRun = { runId: crypto.randomUUID(), mode: rankMode(duration, practice) };
+function start(duration, practice = false, options = {}) {
+  const reconnect = feed?.phase === 'residual';
+  cancelSignal();
+  replaying = Boolean(options.replay);
+  lastEndReason = null;
+  if (!replaying) activeReplay = null;
+  document.body.classList.toggle('replaying', replaying);
+  const seed = options.seed ?? crypto.getRandomValues(new Uint32Array(1))[0];
+  game.random = seededRandom(seed);
+  currentRun = replaying ? null : { runId: crypto.randomUUID(), mode: rankMode(duration, practice), heroName: rankings.profile.nickname };
+  recorder = !replaying && !practice ? new ReplayRecorder(currentRun.mode, seed) : null;
+  if (!replaying) replayPlayer = null;
   lastDuration = duration; lastPractice = practice; resetInput(); showModal(null); $('home').hidden = true; $('hud').hidden = false; $('pause').hidden = false; $('run-clock').hidden = false;
-  document.body.classList.add('playing'); camera = { x: 0, y: 0, zoom: width < 600 ? .88 : 1.2 }; cameraMotion = { x: 0, y: 0 };
+  document.body.classList.add('playing'); camera = { x: 0, y: 0, zoom: 1.2 }; cameraMotion = { x: 0, y: 0 };
   document.body.classList.toggle('practice-mode', Boolean(practice));
   accumulator = 0; detachToastAt = -10;
   $('run-details').open = false;
   if (practice === 'recruitment') {
-    game.startRecruitmentPractice(); gatherToggle = true; $('gather').setAttribute('aria-pressed', 'true');
+    game.startRecruitmentPractice();
     camera.x = game.player.x; camera.y = game.player.y;
   } else if (practice) game.startPractice(); else if (duration === Infinity) game.startChallenge(); else game.start(duration);
+  const openingRequest = game.bombardment.requests.find(request => request.state !== 'complete');
+  if (openingRequest && Math.hypot(openingRequest.x - game.player.x, openingRequest.y - game.player.y) < 380) {
+    camera.x = game.player.x + (openingRequest.x - game.player.x) * .33;
+    camera.y = game.player.y + (openingRequest.y - game.player.y) * .33 - 40;
+    const extentX = Math.max(100, Math.abs(game.player.x - camera.x), Math.abs(openingRequest.x - camera.x) + FIRE_SUPPORT.radius + 12);
+    const extentY = Math.max(100, Math.abs(game.player.y - camera.y), Math.abs(openingRequest.y - camera.y) + FIRE_SUPPORT.radius + 30);
+    camera.zoom = Math.max(.28, Math.min(1, (width / 2 - 40) / extentX, (height / 2 - 95) / extentY));
+  }
   $('recruit-guide').hidden = practice !== 'recruitment';
-  runBest = readBest('murmur-challenge-best');
+  $('restart').firstChild.textContent = practice ? '다시 훈련하기 ' : '다음 출격 ';
+  runBest = memorial.data.best;
   updateBehavior(); updateHUD();
-  $('time-target').textContent = practice === 'recruitment' ? ' / 연습' : practice ? ' / 자유 비행' : game.challenge ? '' : ` / ${timeLabel(duration)}`;
+  $('time-target').textContent = practice === 'recruitment' ? ' / 훈련' : practice ? ' / 자유 비행' : game.challenge ? '' : ` / ${timeLabel(duration)}`;
   document.querySelector('.time-track').hidden = Boolean(practice || game.challenge);
   $('run-best').hidden = !game.challenge;
+  $('exit-replay').hidden = !replaying;
   $('xp-meter').parentElement.hidden = practice;
   canvas.focus({ preventScroll: true });
+  if (reconnect) linkFeed();
   if (document.hidden) game.pause();
 }
 function goHome() {
+  cancelSignal();
+  sound.reset(); sound.setScene('home', 0, false);
+  replaying = false; replayPlayer = null; recorder = null; activeReplay = null; document.body.classList.remove('replaying');
   game.state = 'home'; resetInput(); showModal(null); $('home').hidden = false; $('hud').hidden = true; $('pause').hidden = true; $('run-clock').hidden = true;
-  document.body.classList.remove('playing', 'practice-mode'); updateRecord(); updateIdentity(); $('nickname').focus({ preventScroll: true });
-  $('other-modes').open = false;
+  $('exit-replay').hidden = true; $('home-replay').hidden = !latestReplay;
+  document.body.classList.remove('playing', 'practice-mode'); updateRecord(); $('start').focus({ preventScroll: true });
 }
-function updateRecord() { const record = readBest('murmur-challenge-best'); $('best-record').textContent = record ? `최고 생존 ${recordLabel(record)}` : ''; $('best-record').hidden = !record; }
+function updateRecord() {
+  $('best-record').textContent = pointsLabel(memorial.data.best);
+  updateMemorial();
+}
+function updateMemorial() {
+  const { fallen, total, entries } = memorial.data;
+  $('memorial-empty').hidden = Boolean(entries.length);
+  $('memorial-fallen').textContent = pointsLabel(fallen);
+  $('memorial-total').textContent = pointsLabel(total);
+  $('memorial-list').replaceChildren(...entries.map((entry, index) => {
+    const row = document.createElement('tr'); row.className = 'ranking-row';
+    row.append(rankCell(String(fallen - index).padStart(2, '0'), 'rank-place'), rankCell(entry.name, 'rank-name'),
+      rankCell(entry.completed, 'rank-objectives'), rankCell(entry.kills, 'rank-kills'),
+      rankCell(recordLabel(entry.elapsed), 'rank-duration'), rankCell(pointsLabel(entry.score), 'rank-score'));
+    return row;
+  }));
+}
+
+function renderContribution(contribution) {
+  $('end-time').textContent = pointsLabel(contribution.score);
+  $('end-caption').textContent = '전쟁 기여도';
+  $('end-objectives').textContent = `${contribution.completed}곳`;
+  $('end-kills').textContent = `${game.kills}기`;
+  $('end-flock').textContent = `${game.maxFlock}기`;
+  $('end-duration').textContent = recordLabel(game.elapsed);
+}
+
 function requestEvolution() {
+  if (replaying) return;
   if (!game.levelUp()) return;
+  recorder?.action('evolve');
   updateHUD();
   if (game.state === 'playing') canvas.focus({ preventScroll: true });
 }
+function chooseUpgrade(index) {
+  if (replaying) return;
+  resetInput();
+  if (game.chooseUpgrade(index)) recorder?.action('choose', index);
+}
+function startPlayback(data = latestReplay) {
+  if (!data) return;
+  try { replayPlayer = new ReplayPlayer(data); }
+  catch (error) { $('replay-status').textContent = error.message; return; }
+  activeReplay = data;
+  const duration = data.mode === 'challenge' ? Infinity : data.mode === 'classic' ? 1800 : 180;
+  start(duration, false, { seed: data.seed, replay: true });
+  $('run-best').hidden = false;
+  $('run-best').textContent = '마지막 출격 · 재생 중';
+}
+function finishRecording() {
+  if (!recorder || game.state !== 'ended') return;
+  let replay = null;
+  try {
+    replay = recorder.finish(game); replay.heroName = currentRun?.heroName; latestReplay = replay;
+    $('home-replay').hidden = false; $('replay-button').hidden = false;
+    $('replay-status').textContent = '';
+    saveReplay(latestReplay)
+      .catch(() => { $('replay-status').textContent = '출격 기록 저장 실패'; });
+  } catch { $('replay-status').textContent = '출격 기록 저장 실패'; }
+  recorder = null;
+  if (currentRun) saveFinishedRun(replay);
+}
+function finishPlayback(error = null) {
+  replayPlayer = null; resetInput();
+  $('end-eyebrow').textContent = error ? '마지막 출격 · 재생 중단' : '마지막 출격';
+  $('end-title').textContent = typeof activeReplay?.heroName === 'string' ? activeReplay.heroName : '영웅';
+  $('end-reason').textContent = error ? error.message : game.won ? '출격 완료' : END_REASONS[lastEndReason] ?? '전사';
+  $('end-modal').dataset.outcome = error ? 'lost' : 'replay';
+  $('end-feed').hidden = true;
+  renderContribution(battleContribution(game));
+  $('end-record').hidden = !error; $('end-record').classList.remove('is-new');
+  $('end-record').textContent = error ? '출격 기록 불일치' : '';
+  $('rank-result').hidden = true; $('rank-end').hidden = true; $('replay-button').hidden = true;
+  $('build-summary').textContent = game.upgrades.filter(u => game.stats[u.id]).map(u => `${u.name} ${game.stats[u.id]}단계`).join(' · ');
+  $('build-summary').hidden = !$('build-summary').textContent;
+  $('build-details').hidden = false;
+  $('build-details').open = false;
+  $('restart').firstChild.textContent = '다시 재생 ';
+  if (error) game.state = 'ended';
+  showModal('end-modal');
+}
 $('start-form').addEventListener('submit', event => { event.preventDefault(); beginRun(Infinity); });
-$('classic').addEventListener('click', () => beginRun(1800)); $('quick').addEventListener('click', () => beginRun(180));
-$('practice').addEventListener('click', () => beginRun(1800, true));
-$('recruit-practice').addEventListener('click', () => beginRun(1800, 'recruitment'));
 $('retry-recruit').addEventListener('click', () => start(1800, 'recruitment'));
-$('gather').addEventListener('click', () => { if (game.state === 'playing') { gatherToggle = !gatherToggle; $('gather').setAttribute('aria-pressed', String(gatherToggle)); } });
 $('evolve').addEventListener('click', requestEvolution);
-$('restart').addEventListener('click', () => start(lastDuration, lastPractice)); $('resume').addEventListener('click', () => game.resume());
+$('restart').addEventListener('click', () => replaying ? startPlayback(activeReplay) : start(lastDuration, lastPractice)); $('resume').addEventListener('click', () => game.resume());
+$('home-replay').addEventListener('click', () => startPlayback()); $('replay-button').addEventListener('click', () => startPlayback()); $('exit-replay').addEventListener('click', goHome);
 $('pause').addEventListener('click', () => game.pause()); $('quit').addEventListener('click', goHome); $('home-button').addEventListener('click', goHome);
 $('help').addEventListener('click', openHelp); $('pause-help').addEventListener('click', openHelp); $('close-help').addEventListener('click', closeHelp);
 updateRecord();
+loadReplay().then(data => { if (data && !latestReplay) { latestReplay = data; $('home-replay').hidden = false; } }).catch(() => {});
 
 addEventListener('keydown', event => {
-  const key = event.key.toLowerCase();
-  const isEvolutionKey = event.code === 'KeyE' || key === 'e' || key === 'ㄷ';
-  if (key === 'tab') {
+  // Retain normal dialog focus navigation without gameplay keyboard shortcuts.
+  if (event.key === 'Escape' && activeModal === 'ranking-modal') { event.preventDefault(); closeRanking(); return; }
+  if (event.key === 'Tab') {
     const dialog = document.querySelector('.modal:not([hidden])');
     if (dialog) {
       const buttons = [...dialog.querySelectorAll('button:not(:disabled), summary, select, input')].filter(el => el.getClientRects().length), first = buttons[0], end = buttons.at(-1);
@@ -310,56 +640,24 @@ addEventListener('keydown', event => {
       else if (!event.shiftKey && document.activeElement === end) { event.preventDefault(); first.focus(); }
     }
   }
-  if (activeModal === 'help-modal') { if (key === 'escape') { event.preventDefault(); closeHelp(); } return; }
-  if (activeModal === 'ranking-modal') { if (key === 'escape') { event.preventDefault(); closeRanking(); } return; }
-  if (event.target.matches?.('input, select, textarea')) return;
-  if (event.repeat) return;
-  if (game.state === 'ended' && activeModal === 'end-modal' && key === 'r') { event.preventDefault(); start(lastDuration, lastPractice); return; }
-  if (key === 'escape' || key === 'p') { if (game.state === 'playing') game.pause(); else if (game.state === 'paused') game.resume(); return; }
-  if (game.state === 'upgrade' && ['1', '2', '3'].includes(key)) { game.chooseUpgrade(Number(key) - 1); return; }
-  if (game.state === 'playing') {
-    if (isEvolutionKey) { event.preventDefault(); requestEvolution(); return; }
-    // Space activates a focused control; it only boosts while steering the canvas.
-    if (event.target.closest?.('button, summary') && [' ', 'enter'].includes(key)) return;
-    if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) event.preventDefault();
-    keys.add(key);
-  }
 });
-addEventListener('keyup', event => keys.delete(event.key.toLowerCase()));
-canvas.addEventListener('pointermove', event => {
-  if (event.pointerType === 'touch' && !touches.has(event.pointerId)) return;
-  const point = localPointer(event);
-  if (event.pointerType === 'touch') touches.set(event.pointerId, point);
-  aim = point;
-});
-canvas.addEventListener('pointerdown', event => {
-  if (game.state !== 'playing') return;
-  canvas.focus({ preventScroll: true });
-  canvas.setPointerCapture(event.pointerId);
-  if (event.pointerType === 'touch') touches.set(event.pointerId, localPointer(event));
-  else if (event.button === 2) gatherHeld = true;
-  else if (event.button === 0) mouseHeld = true;
-  aim = localPointer(event);
-});
-canvas.addEventListener('contextmenu', event => { if (game.state !== 'home') event.preventDefault(); });
-function releasePointer(event) { if (event.button === 2 || event.type === 'pointercancel') gatherHeld = false; if (event.button === 0 || event.type === 'pointercancel') mouseHeld = false; touches.delete(event.pointerId); if (event.pointerType === 'touch' && !touches.size) aim = null; }
-addEventListener('pointerup', releasePointer); addEventListener('pointercancel', releasePointer);
 addEventListener('blur', () => { resetInput(); game.pause(); });
-document.addEventListener('visibilitychange', () => { if (document.hidden) { resetInput(); game.pause(); } });
+document.addEventListener('visibilitychange', () => { sound.setHidden(document.hidden); if (document.hidden) { resetInput(); game.pause(); } });
 function getInput() {
+  const aim = flightInput.aim;
   return {
-    dx: Number(keys.has('d') || keys.has('arrowright')) - Number(keys.has('a') || keys.has('arrowleft')),
-    dy: Number(keys.has('s') || keys.has('arrowdown')) - Number(keys.has('w') || keys.has('arrowup')),
     targetX: aim ? (aim.x - width / 2) / camera.zoom + camera.x : undefined,
     targetY: aim ? (aim.y - height / 2) / camera.zoom + camera.y : undefined,
-    boost: keys.has(' ') || mouseHeld || touches.size > 1,
-    gather: keys.has('shift') || gatherHeld || gatherToggle,
+    boost: flightInput.boost,
+    gather: flightInput.gather,
   };
 }
 function updateHUD() {
+  updateSupportHUD();
   $('clock').textContent = game.challenge ? recordLabel(game.elapsed) : timeLabel(game.elapsed); $('time-fill').style.width = `${game.elapsed / game.duration * 100}%`;
-  $('phase-label').textContent = game.practice === 'recruitment' ? '꼬리 데려오기' : game.practice ? '조작 연습' : (game.challenge ? challengePhases : phases)[game.phase];
-  $('run-best').textContent = runBest ? recordScore(game.elapsed) > runBest ? '최고 기록 경신 중' : `최고 ${recordLabel(runBest)}` : '첫 기록에 도전';
+  $('phase-label').textContent = game.practice === 'recruitment' ? '드론 확보 훈련' : game.practice ? '조작 훈련' : (game.challenge ? challengePhases : phases)[game.phase];
+  const contribution = battleContribution(game);
+  $('run-best').textContent = replaying ? `마지막 출격 · 재생 중 · 기여도 ${pointsLabel(contribution.score)}점` : `전쟁 기여도 ${pointsLabel(contribution.score)}점${contribution.score > runBest ? ' · 최고 기록' : ''}`;
   $('detached-count').textContent = game.detachedFollowers;
   $('head-size').textContent = `${Number((game.player.radius / HEAD_GROWTH.baseRadius).toFixed(1))}배 / 최대 ${HEAD_GROWTH.maxScale}배`;
   $('gather').classList.toggle('active', game.player.gathering);
@@ -373,15 +671,16 @@ function updateHUD() {
   $('recruit-progress').textContent = `${Math.floor(Math.max(0, ...recruits.map(b => b.influence)) * 100)}%`;
   $('recruit-signal').hidden = !recruits.length;
   if (game.practice === 'recruitment') {
-    $('recruit-lesson').textContent = game.recruitedFollowers ? `성공! 새 친구 ${game.recruitedFollowers}마리를 데려왔어요` : '꼬리 옆에서 함께 날아요';
-    $('recruit-instruction').textContent = game.recruitedFollowers ? '적 전체는 더 컸지만, 꼬리 끝에서는 우리 친구들이 더 가까이 모여 있었어요.' : '결집을 켜 두었어요. 그대로 오른쪽으로 날며 초록 원이 차는 모습을 보세요. 연습 상대는 직진해요.';
+    $('recruit-lesson').textContent = game.recruitedFollowers ? `통제권 확보 · 드론 ${game.recruitedFollowers}기 연결 완료` : '적 후방 드론 옆에서 함께 비행하세요';
+    $('recruit-instruction').textContent = game.recruitedFollowers ? '적 후방에서 아군 드론이 더 가깝게 모여 통신 우위를 확보했습니다.' : '마우스를 오른쪽으로 향하고 오른쪽 버튼을 꾹 누르세요. 초록 연결 표시가 차면 합류합니다.';
   }
   $('level').textContent = game.level; $('xp-label').textContent = `${Math.floor(game.xp)} / ${game.nextXp}`;
   const evolutionReady = game.xp >= game.nextXp;
   $('evolve').disabled = !game.canEvolve();
-  $('evolve').setAttribute('aria-haspopup', String(UPGRADES.some(u => game.stats[u.id] < u.max) ? 'dialog' : 'false'));
+  $('evolve').hidden = $('evolve').disabled;
+  $('evolve').setAttribute('aria-haspopup', game.availableUpgrades.length ? 'dialog' : 'false');
   $('xp-meter').parentElement.classList.toggle('ready', evolutionReady);
-  const evolutionStatus = evolutionReady ? '진화 준비 완료 · 원할 때 눌러주세요' : '먹이로 진화 에너지를 모아요';
+  const evolutionStatus = evolutionReady ? '개량 준비 완료 · 원할 때 선택하세요' : '표적과 적 기체의 잔해에서 부품을 회수하세요';
   if ($('evolution-status').textContent !== evolutionStatus) $('evolution-status').textContent = evolutionStatus;
   $('xp-fill').style.width = `${clamp(game.xp / game.nextXp, 0, 1) * 100}%`; $('boost-fill').style.width = `${game.energy}%`;
   $('boost-fill').style.background = game.player.exhausted ? '#809382' : colors.lime;
@@ -389,15 +688,130 @@ function updateHUD() {
   $('energy-meter').setAttribute('aria-valuenow', Math.round(game.energy));
   $('xp-meter').setAttribute('aria-valuenow', Math.min(game.nextXp, Math.floor(game.xp)));
   $('xp-meter').setAttribute('aria-valuemax', game.nextXp);
-  $('xp-meter').setAttribute('aria-valuetext', `모은 진화 에너지 ${Math.floor(game.xp)}, 필요한 에너지 ${game.nextXp}${evolutionReady ? ', 진화 가능' : ''}`);
+  $('xp-meter').setAttribute('aria-valuetext', `회수 부품 ${Math.floor(game.xp)}, 개량에 필요한 부품 ${game.nextXp}${evolutionReady ? ', 개량 가능' : ''}`);
 }
 
-function bird(x, y, angle, size, color, alpha = 1, phase = 0) {
+function nearestRequest() {
+  const requests = game.bombardment.requests.filter(r => r.state !== 'complete');
+  return requests.find(r => r.id === game.bombardment.activeId) ?? requests.sort((a, b) =>
+    Math.hypot(a.x - game.player.x, a.y - game.player.y) - Math.hypot(b.x - game.player.x, b.y - game.player.y))[0];
+}
+function updateSupportHUD() {
+  updateRadarHUD();
+  $('support-panel').hidden = !game.bombardment.enabled;
+  $('strike-count').textContent = game.bombardment.completed;
+  if (!game.bombardment.enabled) return;
+  const r = nearestRequest();
+  $('support-heading').textContent = r ? `폭격 목표 ${String(r.id).padStart(2, '0')}` : '전장 통신';
+  let title = '새 좌표 수신 중', detail = '다음 폭격 목표 대기', progress = game.bombardment.completed ? 1 : 0;
+  let progressLabel = game.bombardment.completed ? '제압 완료' : '새 요청 대기', rewardLabel = '다음 좌표 대기 중';
+  if (r) {
+    title = `좌표 ${requestCoordinates(r)}`;
+    const distance = Math.hypot(r.x - game.player.x, r.y - game.player.y);
+    progress = facilityDamage(r) / facilityDurability(r);
+    progressLabel = `시설 피해 ${facilityDamage(r)} / ${facilityDurability(r)}`;
+    rewardLabel = `제압 시 부품 +${r.reward}`;
+    $('support-bearing').style.transform = `rotate(${Math.atan2(r.y - game.player.y, r.x - game.player.x)}rad)`;
+    if (r.state === 'bombing') {
+      detail = `${TARGET_NAMES[r.kind]} · 드론 폭격 중`;
+    } else if (r.state === 'paused') {
+      detail = `${TARGET_NAMES[r.kind]} · 폭격 중단 · ${Math.round(distance)}m`;
+    } else detail = game.player.boids.length ? `${TARGET_NAMES[r.kind]} · 드론 진입 시 폭격 · ${Math.round(distance)}m` : '드론 연결 상실 · 회색 드론 곁에서 결집';
+  }
+  $('support-title').textContent = title; $('support-detail').textContent = detail;
+  $('support-bearing').hidden = !r || r.state === 'bombing' || !game.player.boids.length;
+  $('support-progress-label').textContent = progressLabel; $('support-reward').textContent = rewardLabel;
+  $('support-fill').style.width = `${progress * 100}%`;
+  $('support-meter').setAttribute('aria-valuenow', Math.round(progress * 100));
+  $('support-meter').setAttribute('aria-valuetext', progressLabel);
+  $('support-panel').classList.toggle('active', r?.state === 'bombing');
+  $('support-panel').classList.toggle('complete', !r && game.bombardment.completed > 0);
+}
+
+function updateRadarHUD() {
+  const defense = game.bombardment.defense, state = defense.state;
+  const airborne = defense.shells.length > 0;
+  const danger = state === 'locked' || state === 'salvo' || airborne;
+  const visible = game.bombardment.enabled && defense.enabled && (state !== 'idle' || defense.overflight || airborne);
+  $('radar-warning').hidden = !visible;
+  viewport.classList.toggle('radar-threat', Boolean(visible));
+  viewport.classList.toggle('radar-locked', Boolean(visible && danger));
+  viewport.classList.toggle('radar-incoming', Boolean(visible && (state === 'salvo' || airborne)));
+  if (!visible) return;
+  $('radar-warning').dataset.state = airborne && state !== 'locked' ? 'salvo' : state;
+  const labels = { tracking: '적 레이더 추적 중', locked: '예측 탄막 · 항로 변경', salvo: '대공포 연속 사격', cooldown: '대공포 재장전', lost: '레이더 추적 해제', idle: '적 시설 상공' };
+  const solution = FLAK_PATTERN_LABELS[defense.pattern] ?? FLAK_PATTERN_LABELS.predict;
+  const title = state === 'locked' ? solution.name : airborne && state !== 'salvo' ? '대공포탄 접근 중' : labels[state];
+  if ($('radar-title').textContent !== title) $('radar-title').textContent = title;
+  $('radar-detail').textContent = state === 'locked' ? `발포 ${Math.max(0, defense.timer).toFixed(1)}초 전 · ${solution.counter}`
+    : state === 'salvo' ? `${defense.shotIndex} / ${defense.salvo.length}발 발사 · ${solution.counter}`
+    : airborne ? '발사된 포탄은 계속 접근합니다 · 회피 유지'
+    : state === 'tracking' ? '현재 항로를 계산 중 · 직진 주의'
+    : state === 'cooldown' ? '재장전 중 · 거리 확보'
+    : state === 'lost' ? '안전 거리 확보' : '사거리 밖으로 이탈';
+  $('radar-overflight').hidden = !defense.overflight;
+  const progress = state === 'tracking' ? defense.progress : state === 'locked' ? 1 - defense.timer / defense.config.warningSeconds : danger ? 1 : 0;
+  $('radar-fill').style.width = `${progress * 100}%`;
+}
+
+function drone(x, y, angle, size, color, alpha = 1, faction = 'hostile') {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(angle + Math.PI / 2); ctx.globalAlpha = alpha;
+  if (faction === 'neutral') ctx.filter = 'grayscale(1)';
+  if (sprite(ctx, faction === 'hostile' ? 'hostile' : 'drone', -size * 1.2, -size * 1.2, size * 2.4)) {
+    ctx.fillStyle = color; ctx.fillRect(-size * .65, 0, 1.8, 1.8); ctx.fillRect(size * .65 - 1.8, 0, 1.8, 1.8);
+    ctx.restore(); return;
+  }
+  ctx.restore();
   ctx.save(); ctx.translate(x, y); ctx.rotate(angle); ctx.globalAlpha = alpha; ctx.fillStyle = color;
-  const wing = size * (reducedMotion ? 1 : 1 + Math.sin(visualTime * 7 + phase) * .18);
-  ctx.beginPath(); ctx.moveTo(size, 0); ctx.lineTo(-size * .55, -wing);
-  ctx.lineTo(-size * .2, -size * .18); ctx.lineTo(-size * .7, 0);
-  ctx.lineTo(-size * .2, size * .18); ctx.lineTo(-size * .55, wing); ctx.closePath(); ctx.fill(); ctx.restore();
+  // Rigid swept wings and a central fuselage distinguish autonomous aircraft.
+  ctx.beginPath(); ctx.moveTo(size, 0); ctx.lineTo(size * .12, -size * .23);
+  ctx.lineTo(-size * .36, -size * .92); ctx.lineTo(-size * .7, -size * .82);
+  ctx.lineTo(-size * .45, -size * .18); ctx.lineTo(-size * .78, -size * .14);
+  ctx.lineTo(-size * .78, size * .14); ctx.lineTo(-size * .45, size * .18);
+  ctx.lineTo(-size * .7, size * .82); ctx.lineTo(-size * .36, size * .92);
+  ctx.lineTo(size * .12, size * .23); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#163e41'; ctx.lineWidth = Math.max(.7, size * .14);
+  ctx.beginPath(); ctx.moveTo(size * .45, 0); ctx.lineTo(-size * .25, 0); ctx.stroke();
+  ctx.strokeStyle = '#b9edf0'; ctx.globalAlpha = alpha * .75;
+  ctx.beginPath(); ctx.moveTo(-size * .8, 0); ctx.lineTo(-size * 1.2, 0); ctx.stroke();
+  ctx.restore();
+}
+function commandAircraft(head) {
+  const r = head.radius, color = head.player ? '#dff8fb' : flockColor(head);
+  ctx.save(); ctx.translate(head.x, head.y); ctx.rotate(head.angle - Math.PI / 2);
+  ctx.shadowColor = head.player ? '#a6ecf4' : '#ff6a5c'; ctx.shadowBlur = 3;
+  if (sprite(ctx, 'command', -r, -r, r * 2)) {
+    ctx.shadowBlur = 0; ctx.fillStyle = head.player ? '#c8f6fb' : '#ff5a4a';
+    ctx.fillRect(-r * .8, -r * .22, 2.5, 2.5); ctx.fillRect(r * .8 - 2.5, -r * .22, 2.5, 2.5);
+    ctx.restore(); return;
+  }
+  ctx.restore();
+  ctx.save(); ctx.translate(head.x, head.y); ctx.rotate(head.angle);
+  // Keep the hull inside the existing collision radius. Engine exhaust is cosmetic.
+  ctx.fillStyle = color; ctx.strokeStyle = head.player ? '#94bfc1' : '#9d6d65'; ctx.lineWidth = .8;
+  ctx.beginPath(); ctx.moveTo(r, 0); ctx.lineTo(r * .36, -r * .22);
+  ctx.lineTo(-r * .3, -r * .95); ctx.lineTo(-r * .55, -r * .82);
+  ctx.lineTo(-r * .4, -r * .3); ctx.lineTo(-r * .72, -r * .27);
+  ctx.lineTo(-r * .87, -r * .43); ctx.lineTo(-r * .91, -r * .1);
+  ctx.lineTo(-r * .76, 0); ctx.lineTo(-r * .91, r * .1);
+  ctx.lineTo(-r * .87, r * .43); ctx.lineTo(-r * .72, r * .27);
+  ctx.lineTo(-r * .4, r * .3); ctx.lineTo(-r * .55, r * .82);
+  ctx.lineTo(-r * .3, r * .95); ctx.lineTo(r * .36, r * .22);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#163e49';
+  ctx.beginPath(); ctx.moveTo(r * .63, 0); ctx.lineTo(r * .12, -r * .14);
+  ctx.lineTo(-r * .15, 0); ctx.lineTo(r * .12, r * .14); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#527e7c'; ctx.lineWidth = Math.max(.6, r * .045);
+  for (const side of [-1, 1]) {
+    ctx.beginPath(); ctx.moveTo(-r * .17, side * r * .29); ctx.lineTo(-r * .43, side * r * .7); ctx.stroke();
+    ctx.fillStyle = '#315860'; ctx.fillRect(-r * .76, side * r * .2 - r * .06, r * .23, r * .12);
+    ctx.strokeStyle = head.boosting ? '#eefcff' : '#9edfeb';
+    ctx.lineWidth = Math.max(1, r * .1); ctx.globalAlpha = head.boosting ? .95 : .65;
+    ctx.beginPath(); ctx.moveTo(-r * .77, side * r * .2);
+    ctx.lineTo(-r * (head.boosting ? 1.65 : 1.12), side * r * .2); ctx.stroke();
+    ctx.globalAlpha = 1; ctx.strokeStyle = '#527e7c'; ctx.lineWidth = Math.max(.6, r * .045);
+  }
+  ctx.restore();
 }
 function birdTrail(b, color) {
   if (reducedMotion || b.trail.length < 2) return;
@@ -435,38 +849,29 @@ function leaderWake(head, time) {
   // the camera moves. A time window naturally makes faster motion travel farther.
   const speed = clamp((Math.hypot(head.vx, head.vy) - 50) / 160, 0, 1);
   const lifetime = .24 + speed * .22;
-  ctx.save(); ctx.lineCap = 'round'; ctx.strokeStyle = flockColor(head);
+  ctx.save(); ctx.lineCap = 'round'; ctx.strokeStyle = head.player ? '#a7d7dd' : flockColor(head);
   for (let i = 1; i < trail.length; i++) {
     const a = trail[i - 1], b = trail[i], fade = clamp(1 - (time - b.time) / lifetime, 0, 1);
     if (!fade) continue;
-    ctx.globalAlpha = (.12 + speed * .1) * fade ** 1.7;
-    ctx.lineWidth = head.radius * 1.45 * fade;
-    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-  }
-  // A few fading silhouettes read as afterimages, not additional flock members.
-  let lastGhost = null;
-  for (let age = .1; age < lifetime; age += .085) {
-    const sample = trail.find(point => time - point.time <= age);
-    if (!sample || Math.hypot(head.x - sample.x, head.y - sample.y) < 10 ||
-        (lastGhost && Math.hypot(lastGhost.x - sample.x, lastGhost.y - sample.y) < 8)) continue;
-    lastGhost = sample;
-    const fade = 1 - age / lifetime;
-    ctx.globalAlpha = .18 * fade; ctx.fillStyle = head.player ? '#dff5b4' : flockColor(head);
-    ctx.beginPath(); ctx.arc(sample.x, sample.y, head.radius * (.55 + fade * .35), 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = (.18 + speed * .16) * fade ** 1.7;
+    ctx.lineWidth = Math.max(.7, head.radius * .09) * fade;
+    for (const side of [-1, 1]) {
+      const offset = side * head.radius * .2;
+      ctx.beginPath();
+      ctx.moveTo(a.x - Math.sin(a.angle) * offset, a.y + Math.cos(a.angle) * offset);
+      ctx.lineTo(b.x - Math.sin(b.angle) * offset, b.y + Math.cos(b.angle) * offset); ctx.stroke();
+    }
   }
   ctx.restore();
 }
 function leaderHeading(head) {
   ctx.save(); ctx.translate(head.x, head.y); ctx.rotate(head.angle);
-  ctx.save(); const markerScale = Math.sqrt(head.radius / HEAD_GROWTH.baseRadius); ctx.scale(markerScale, markerScale);
-  ctx.strokeStyle = '#214531'; ctx.lineWidth = 2.3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  ctx.beginPath(); ctx.moveTo(1, -3.4); ctx.lineTo(5, 0); ctx.lineTo(1, 3.4); ctx.stroke();
-  ctx.restore();
-  ctx.strokeStyle = '#e4f6ba'; ctx.globalAlpha = .8; ctx.lineWidth = 1.7;
-  ctx.beginPath(); ctx.arc(0, 0, head.radius + 6, -.37, .37); ctx.stroke();
+  const target = angleDelta(head.angle, head.targetHeading ?? head.angle);
+  ctx.strokeStyle = '#a8d7c1'; ctx.globalAlpha = .8; ctx.lineWidth = 1.5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(0, 0, head.radius + 5, target - .22, target + .22); ctx.stroke();
   ctx.restore();
 }
-function flockColor(e) { return e.player ? colors.lime : e.type === 'hunter' ? '#de858f' : e.type === 'titan' ? '#d8aa74' : colors.coral; }
+function flockColor(e) { return e.player ? colors.lime : e.type === 'hunter' ? '#ff4d73' : e.type === 'titan' ? '#e8744f' : colors.coral; }
 function mixColor(from, to, amount) {
   const a = parseInt(from.slice(1), 16), b = parseInt(to.slice(1), 16);
   const r = Math.round(lerp((a >> 16) & 255, (b >> 16) & 255, amount));
@@ -482,6 +887,7 @@ function background(home = false) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.fillStyle = '#091e24'; ctx.fillRect(0, 0, width, height);
   glow(width * .7, height * .45, width * .6, '#194b3b', .36);
   if (!home) { scenery.draw(ctx, camera, width, height, cameraMotion, reducedMotion); return; }
+  ctx.globalAlpha = .15; sprite(ctx, 'airport', width * .1, height * .05, height * .9); ctx.globalAlpha = 1;
   const space = 46, ox = 0, oy = 0;
   ctx.fillStyle = '#81b99b'; ctx.globalAlpha = .1;
   for (let y = oy; y < height; y += space) for (let x = ox; x < width; x += space) { ctx.beginPath(); ctx.arc(x, y, .7, 0, Math.PI * 2); ctx.fill(); }
@@ -490,7 +896,7 @@ function background(home = false) {
 // The title screen runs the same neighbor-based flock simulation as gameplay.
 const demo = new Game();
 demo.state = 'playing'; demo.spawnTimer = Infinity; demo.duration = Infinity; demo.stats.separation = 1;
-while (demo.player.boids.length < 100) demo.addBoid(demo.player);
+while (demo.player.boids.length < 8) demo.addBoid(demo.player);
 let demoAccumulator = 0;
 const demoCamera = { x: 0, y: 0 };
 function stepDemo() {
@@ -507,8 +913,8 @@ function drawHome(dt) {
     while (demoAccumulator >= 1 / 60) { stepDemo(); demoAccumulator -= 1 / 60; }
   }
   background(true);
-  const small = width < 600, cx = width * (small ? .73 : .735), cy = height * (small ? .22 : .47);
-  const scale = Math.min(width / 1280, height / 780) * (small ? 2.1 : 1.6);
+  const cx = width * .7, cy = height * .47;
+  const scale = Math.min(width / 1280, height / 780) * 1.6;
   const head = demo.player;
   const centerX = head.boids.reduce((sum, b) => sum + b.x, head.x) / (head.boids.length + 1);
   const centerY = head.boids.reduce((sum, b) => sum + b.y, head.y) / (head.boids.length + 1);
@@ -519,27 +925,42 @@ function drawHome(dt) {
   ctx.translate(-demoCamera.x, -demoCamera.y);
   leaderWake(head, demo.elapsed);
   for (const b of head.boids) {
-    birdTrail(b, '#c9ed92');
-    bird(b.x, b.y, b.angle, b.radius, '#d0e8a0', .72 + Math.sin(b.seed) * .18, b.seed);
+    birdTrail(b, colors.lime);
+    drone(b.x, b.y, b.angle, b.radius, '#a9e9f1', .72 + Math.sin(b.seed) * .18, 'friendly');
   }
-  glow(head.x, head.y, 72, '#b1d984', .12);
-  ctx.fillStyle = '#e4f3af'; ctx.beginPath(); ctx.arc(head.x, head.y, 12, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = '#c9ed9250'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(head.x, head.y, 20, 0, Math.PI * 2); ctx.stroke();
+  glow(head.x, head.y, 72, '#6fd0de', .12);
+  commandAircraft(head);
+  ctx.strokeStyle = '#78dcea50'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(head.x, head.y, 20, 0, Math.PI * 2); ctx.stroke();
   leaderHeading(head);
   ctx.restore();
 }
 function onScreen(x, y, pad = 80) { return Math.abs((x - camera.x) * camera.zoom) < width / 2 + pad && Math.abs((y - camera.y) * camera.zoom) < height / 2 + pad; }
 function drawWorld(dt) {
   const p = game.player;
-  const centerX = p.boids.reduce((sum, b) => sum + b.x, p.x) / (p.boids.length + 1);
-  const centerY = p.boids.reduce((sum, b) => sum + b.y, p.y) / (p.boids.length + 1);
-  const focusX = lerp(centerX, p.x, .48) + Math.cos(p.angle) * 22;
-  const focusY = lerp(centerY, p.y, .48) + Math.sin(p.angle) * 22;
-  const extentX = Math.max(100, ...[p, ...p.boids].map(b => Math.abs(b.x - focusX)));
-  const extentY = Math.max(100, ...[p, ...p.boids].map(b => Math.abs(b.y - focusY)));
+  let sumX = p.x, sumY = p.y;
+  for (const b of p.boids) { sumX += b.x; sumY += b.y; }
+  const centerX = sumX / (p.boids.length + 1), centerY = sumY / (p.boids.length + 1);
+  let focusX = lerp(centerX, p.x, .48) + Math.cos(p.angle) * 22;
+  let focusY = lerp(centerY, p.y, .48) + Math.sin(p.angle) * 22;
+  const groundTarget = nearestRequest();
+  const targetDistance = groundTarget ? Math.hypot(groundTarget.x - p.x, groundTarget.y - p.y) : Infinity;
+  const targetFraming = clamp((380 - targetDistance) / 130, 0, 1);
+  if (groundTarget && targetFraming) {
+    focusX = lerp(focusX, groundTarget.x, .35 * targetFraming);
+    focusY = lerp(focusY, groundTarget.y, .35 * targetFraming) - 40 * targetFraming;
+  }
+  let extentX = Math.max(100, Math.abs(p.x - focusX)), extentY = Math.max(100, Math.abs(p.y - focusY));
+  for (const b of p.boids) {
+    extentX = Math.max(extentX, Math.abs(b.x - focusX));
+    extentY = Math.max(extentY, Math.abs(b.y - focusY));
+  }
+  if (groundTarget && targetFraming) {
+    extentX = Math.max(extentX, Math.abs(groundTarget.x - focusX) + (FIRE_SUPPORT.radius + 12) * targetFraming);
+    extentY = Math.max(extentY, Math.abs(groundTarget.y - focusY) + (FIRE_SUPPORT.radius + 30) * targetFraming);
+  }
   // Start closer to the flock, then gradually widen the view as the leader
   // evolves. The fit limits still protect the flock from being clipped.
-  const closeZoom = width < 600 ? 1.15 : 1.5;
+  const closeZoom = 1.5;
   const evolutionProgress = clamp((headScaleForLevel(game.level) - 1) / (HEAD_GROWTH.maxScale - 1), 0, 1);
   const evolutionZoom = lerp(1, .78, evolutionProgress);
   const targetZoom = Math.min(closeZoom * evolutionZoom, (width / 2 - 28) / extentX, (height / 2 - 110) / extentY);
@@ -556,37 +977,45 @@ function drawWorld(dt) {
   // The finite arena is a soft current: entering its edge steers a head inward.
   ctx.strokeStyle = '#7cad8960'; ctx.lineWidth = 2; ctx.setLineDash([5, 12]); ctx.beginPath(); ctx.arc(0, 0, WORLD_RADIUS, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
   ctx.strokeStyle = '#6695730a'; ctx.lineWidth = 70; ctx.beginPath(); ctx.arc(0, 0, WORLD_RADIUS + 35, 0, Math.PI * 2); ctx.stroke();
+  drawGroundWar(ctx, game, camera, onScreen, reducedMotion);
   for (const f of game.food) {
     if (!onScreen(f.x, f.y, 20)) continue;
     const shimmer = .65 + Math.sin(visualTime * 2 + f.seed) * .2, size = f.value > 1 ? 3.2 : 1.9;
-    ctx.fillStyle = f.value > 1 ? colors.gold : '#a8c886'; ctx.globalAlpha = shimmer;
+    ctx.fillStyle = f.source === 'strike' ? '#ffd08a' : f.value > 1 ? colors.amber : '#d6b27a'; ctx.globalAlpha = shimmer;
     if (f.value > 1) { ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(Math.PI / 4); ctx.fillRect(-size, -size, size * 2, size * 2); ctx.restore(); }
     else { ctx.beginPath(); ctx.arc(f.x, f.y, size, 0, Math.PI * 2); ctx.fill(); }
     ctx.globalAlpha = .05; ctx.beginPath(); ctx.arc(f.x, f.y, size * 4, 0, Math.PI * 2); ctx.fill();
   }
   ctx.globalAlpha = 1;
-  const drawOrder = [...game.entities.filter(e => !e.player), p];
-  const factions = new Map(game.entities.map(e => [e.id, e]));
+  renderOrder.length = 0; renderFactions.clear();
+  for (const e of game.entities) {
+    renderFactions.set(e.id, e);
+    if (!e.player) renderOrder.push(e);
+  }
+  renderOrder.push(p);
   let recruitFocus = null;
-  for (const b of [...game.entities.flatMap(e => e.boids), ...game.strays]) {
+  for (const e of game.entities) for (const b of e.boids) {
     if (b.influenceTarget === p.id && b.influence > .1 && onScreen(b.x, b.y) && (!recruitFocus || b.influence > recruitFocus.influence)) recruitFocus = b;
   }
-  for (const e of drawOrder) if (e.alive && onScreen(e.x, e.y, 140)) leaderWake(e, game.elapsed);
+  for (const b of game.strays) {
+    if (b.influenceTarget === p.id && b.influence > .1 && onScreen(b.x, b.y) && (!recruitFocus || b.influence > recruitFocus.influence)) recruitFocus = b;
+  }
+  for (const e of renderOrder) if (e.alive && onScreen(e.x, e.y, 140)) leaderWake(e, game.elapsed);
   for (const b of game.strays) {
     if (!onScreen(b.x, b.y, 25)) continue;
-    const target = factions.get(b.influenceTarget);
+    const target = renderFactions.get(b.influenceTarget);
     const color = target ? mixColor('#819995', flockColor(target), b.influence * .8) : '#819995';
-    birdTrail(b, color); bird(b.x, b.y, b.angle, b.radius, color, .65, b.seed);
+    birdTrail(b, color); drone(b.x, b.y, b.angle, b.radius, color, .65, 'neutral');
     allegianceRing(b);
   }
-  for (const e of drawOrder) {
+  for (const e of renderOrder) {
     if (!e.alive) continue;
     const color = flockColor(e);
-    if (onScreen(e.x, e.y)) glow(e.x, e.y, e.player ? 85 : 50, e.player ? '#d0ef9140' : '#e9827830', .32);
+    if (onScreen(e.x, e.y)) glow(e.x, e.y, e.player ? 85 : 50, e.player ? '#9fe6f040' : '#ff6a5c30', .32);
     for (let i = e.boids.length - 1; i >= 0; i--) {
       const b = e.boids[i]; if (!onScreen(b.x, b.y, 20)) continue;
       const alpha = .8 + Math.sin(b.seed) * .13;
-      const target = factions.get(b.influenceTarget);
+      const target = renderFactions.get(b.influenceTarget);
       const birdColor = b.influence > 0 ? mixColor(color, target ? flockColor(target) : colors.gold, b.influence * .9) : color;
       if (e.player && b.linkReach && Math.hypot(b.x - b.linkX, b.y - b.linkY) > b.linkReach * .78) {
         ctx.strokeStyle = colors.gold; ctx.lineWidth = 1; ctx.globalAlpha = .45;
@@ -594,7 +1023,7 @@ function drawWorld(dt) {
         ctx.setLineDash([]); ctx.globalAlpha = 1;
       }
       birdTrail(b, birdColor);
-      bird(b.x, b.y, b.angle, b.radius, birdColor, alpha, b.seed);
+      drone(b.x, b.y, b.angle, b.radius, birdColor, alpha, e.player ? 'friendly' : 'hostile');
       allegianceRing(b);
       if (e.boosting && i % 3 === 0 && !reducedMotion) {
         ctx.globalAlpha = .16; ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(b.x - Math.cos(b.angle) * 17, b.y - Math.sin(b.angle) * 17); ctx.stroke(); ctx.globalAlpha = 1;
@@ -603,19 +1032,20 @@ function drawWorld(dt) {
     if (!onScreen(e.x, e.y)) continue;
     const shieldAlpha = e.invincible > 0 ? .25 + Math.sin(visualTime * 12) * .12 : .12;
     ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.globalAlpha = shieldAlpha; ctx.beginPath(); ctx.arc(e.x, e.y, e.radius + 6, 0, Math.PI * 2); ctx.stroke(); ctx.globalAlpha = 1;
-    ctx.fillStyle = e.player ? '#e8f7ba' : color; ctx.beginPath(); ctx.arc(e.x, e.y, e.radius, 0, Math.PI * 2); ctx.fill();
+    commandAircraft(e);
     if (e.boosting || e.gathering) {
       ctx.strokeStyle = e.boosting ? '#f3ebce' : color; ctx.lineWidth = e.boosting ? 2 : 1; ctx.globalAlpha = .75;
       ctx.beginPath(); ctx.arc(e.x, e.y, e.radius + (e.boosting ? 9 : 3), 0, Math.PI * 2); ctx.stroke(); ctx.globalAlpha = 1;
     }
     if (e.player) leaderHeading(e);
-    else { ctx.fillStyle = '#153e32'; ctx.beginPath(); ctx.arc(e.x + Math.cos(e.angle) * 5, e.y + Math.sin(e.angle) * 5, 2.6, 0, Math.PI * 2); ctx.fill(); }
     if (!e.player) {
-      const action = { roam: '탐색', forage: '먹이 접근', pursue: '진로 차단', regroup: '재결집', recover: '동료 회수', evade: '회피' }[e.intent];
+      const action = { roam: '탐색', forage: '부품 회수', pursue: '진로 차단', intercept: '지원 드론 공격', regroup: '재결집', recover: '드론 회수', evade: '회피' }[e.intent];
       ctx.font = '10px system-ui'; ctx.textAlign = 'center'; ctx.fillStyle = color; ctx.globalAlpha = .8;
-      ctx.fillText(game.practice === 'recruitment' ? `직진하는 연습 상대 · ${e.boids.length}마리` : `${TEMPERAMENTS[e.temperament]} · ${action}`, e.x, e.y - 28); ctx.globalAlpha = 1;
+      ctx.fillText(game.practice === 'recruitment' ? `훈련 편대 · ${e.boids.length}기` : `${TEMPERAMENTS[e.temperament]} · ${action}`, e.x, e.y - 28); ctx.globalAlpha = 1;
     }
   }
+  drawBombs(ctx, game, reducedMotion);
+  drawAirDefense(ctx, game, camera, reducedMotion);
   for (const r of game.rings) { ctx.strokeStyle = colors[r.color]; ctx.lineWidth = 1; ctx.globalAlpha = r.life * .45; ctx.beginPath(); ctx.arc(r.x, r.y, Math.max(1, (1 - r.life) * r.max), 0, Math.PI * 2); ctx.stroke(); }
   for (const particle of game.particles) { ctx.fillStyle = colors[particle.color]; ctx.globalAlpha = particle.life * .7; ctx.beginPath(); ctx.arc(particle.x, particle.y, 1.7, 0, Math.PI * 2); ctx.fill(); }
   ctx.globalAlpha = 1;
@@ -623,20 +1053,32 @@ function drawWorld(dt) {
     const b = recruitFocus;
     ctx.font = '11px system-ui'; ctx.textAlign = 'center'; ctx.lineWidth = 4;
     ctx.strokeStyle = '#102a28'; ctx.fillStyle = colors.lime;
-    const label = `합류 중 ${Math.floor(b.influence * 100)}%`;
+    const label = `연결 중 ${Math.floor(b.influence * 100)}%`;
     ctx.strokeText(label, b.x, b.y - 23); ctx.fillText(label, b.x, b.y - 23);
   }
   ctx.restore(); drawEdgeIndicators(); drawMinimap();
 }
 function drawEdgeIndicators() {
   if (game.state !== 'playing') return;
+  const request = nearestRequest();
+  if (request) {
+    const sx = (request.x - camera.x) * camera.zoom + width / 2, sy = (request.y - camera.y) * camera.zoom + height / 2;
+    if (sx < 32 || sx > width - 32 || sy < 185 || sy > height - 240) {
+      const angle = Math.atan2(sy - height / 2, sx - width / 2);
+      const reach = Math.min((width / 2 - 30) / Math.max(.001, Math.abs(Math.cos(angle))), (height / 2 - 195) / Math.max(.001, Math.abs(Math.sin(angle))));
+      const x = width / 2 + Math.cos(angle) * Math.max(30, reach), y = height / 2 + Math.sin(angle) * Math.max(30, reach);
+      ctx.save(); ctx.translate(x, y); ctx.rotate(angle); ctx.fillStyle = '#efbb77';
+      ctx.beginPath(); ctx.moveTo(8, 0); ctx.lineTo(-4, -5); ctx.lineTo(-4, 5); ctx.closePath(); ctx.fill(); ctx.restore();
+      ctx.font = '10px system-ui'; ctx.fillStyle = '#efbb77'; ctx.textAlign = 'center'; ctx.fillText('요청', x, y + 19);
+    }
+  }
   for (const e of game.entities) {
     if (e.player || !e.alive) continue;
     const sx = (e.x - camera.x) * camera.zoom + width / 2, sy = (e.y - camera.y) * camera.zoom + height / 2;
     if (sx > 30 && sx < width - 30 && sy > 100 && sy < height - 85) continue;
     const dist = Math.hypot(e.x - game.player.x, e.y - game.player.y); if (dist > 850) continue;
     const x = clamp(sx, 18, width - 18), y = clamp(sy, 112, height - 100), angle = Math.atan2(sy - height / 2, sx - width / 2);
-    bird(x, y, angle, 4, colors.coral, .25 + (1 - dist / 850) * .4);
+    drone(x, y, angle, 4, colors.coral, .25 + (1 - dist / 850) * .4);
   }
 }
 function drawMinimap() {
@@ -644,6 +1086,12 @@ function drawMinimap() {
   map.fillStyle = '#06201e55'; map.strokeStyle = '#7ca78e30'; map.lineWidth = 1;
   map.beginPath(); map.arc(80, 80, 70, 0, Math.PI * 2); map.fill(); map.stroke();
   map.strokeStyle = '#7ca78e13'; map.beginPath(); map.moveTo(10, 80); map.lineTo(150, 80); map.moveTo(80, 10); map.lineTo(80, 150); map.stroke();
+  for (const r of game.bombardment.requests) {
+    map.strokeStyle = r.state === 'complete' ? colors.lime : colors.amber; map.lineWidth = 1.5;
+    const x = 80 + r.x * scale, y = 80 + r.y * scale;
+    map.strokeRect(x - 3, y - 3, 6, 6);
+    if (r.id === game.bombardment.activeId) { map.beginPath(); map.arc(x, y, 7, 0, Math.PI * 2); map.stroke(); }
+  }
   for (const e of game.entities) {
     if (!e.alive) continue; map.fillStyle = e.player ? colors.lime : colors.coral; map.globalAlpha = e.player ? 1 : .55;
     map.beginPath(); map.arc(80 + e.x * scale, 80 + e.y * scale, e.player ? 3 : 1.8, 0, Math.PI * 2); map.fill();
@@ -654,13 +1102,23 @@ function frame(now) {
   const dt = last ? Math.min((now - last) / 1000, .08) : 1 / 60; last = now; visualTime += dt;
   if (game.state === 'playing') {
     accumulator = Math.min(accumulator + dt, .1);
-    while (accumulator >= 1 / 60 && game.state === 'playing') {
-      game.update(1 / 60, getInput());
+    while (accumulator >= REPLAY_STEP && game.state === 'playing') {
+      if (replaying) {
+        try { if (replayPlayer?.step(game)) finishPlayback(); }
+        catch (error) { finishPlayback(error); }
+      } else {
+        const input = getInput();
+        recorder?.input(input);
+        game.update(REPLAY_STEP, input);
+        recorder?.afterStep(game);
+        if (game.state === 'ended') finishRecording();
+      }
       for (const e of game.entities) if (e.alive) rememberLeader(e, game.elapsed);
-      accumulator -= 1 / 60;
+      accumulator -= REPLAY_STEP;
     }
     if (toastTimer > 0) { toastTimer -= dt; if (toastTimer <= 0) $('toast').classList.remove('visible'); }
   } else accumulator = 0;
+  sound.update(game); updateEffects(dt);
   if (game.state === 'home') drawHome(dt); else drawWorld(game.state === 'playing' ? dt : 0);
   hudTime += dt; if (hudTime > .1 && game.state !== 'home') { updateHUD(); hudTime = 0; }
   requestAnimationFrame(frame);
