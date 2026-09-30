@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Game, SpatialGrid } from '../src/engine.mjs';
+import { FleetBattleGame } from '../src/fleet-battle.mjs';
+import { captureFleetState, restoreFleetState, firstFleetDifference } from '../src/fleet-state.mjs';
+import { DMath } from '../src/deterministic-math.mjs';
 import { seededRandom } from '../src/simulation-rng.mjs';
 
 // The former string-key traversal is a deliberately simple query oracle.
@@ -112,6 +115,64 @@ test('dense flock output matches string-key cell traversal and keeps the nearest
   game.prepareInfluence();
   game.updateFlock(p, 1 / 60, true);
   assert.deepStrictEqual(subject.neighborScratch.slice(0, 7).map(record => record.other.id), [1, 2, 3, 4, 5, 6, 7]);
+});
+
+// Drops the optional pass argument, so every flow value is recomputed per call.
+class DirectHandlingGame extends FleetBattleGame {
+  droneHandling(entity, b, flow, dt, strain) { return super.droneHandling(entity, b, flow, dt, strain); }
+}
+// Records which flows reached drone handling with the shared pass. Kept off the
+// game, since every own game field is checkpointed state.
+const observed = { leader: 0, upstream: 0, entities: new Set() };
+class ObservedHandlingGame extends FleetBattleGame {
+  droneHandling(entity, b, flow, dt, strain, pass) {
+    if (pass && flow) {
+      observed[flow === entity ? 'leader' : 'upstream']++;
+      observed.entities.add(entity.id);
+    }
+    return super.droneHandling(entity, b, flow, dt, strain, pass);
+  }
+}
+const fleetInput = tick => ({ dx: tick % 150 < 50 ? 1 : tick % 150 < 100 ? 0 : -1, dy: tick % 150 < 50 ? 0 : 1,
+  boost: tick % 90 >= 20 && tick % 90 < 60, gather: tick % 120 >= 80 });
+
+test('shared flow values match per-call drone handling across ticks, fleets and a restore', () => {
+  const seed = 0x5eed17;
+  let shared = new ObservedHandlingGame(); shared.startFleetBattle(seed);
+  const direct = new DirectHandlingGame(); direct.startFleetBattle(seed);
+  for (let tick = 0; tick < 420; tick++) {
+    if (tick === 210) {
+      // A restored game starts from fresh drones and a fresh pass.
+      shared = restoreFleetState(new ObservedHandlingGame(), captureFleetState(shared));
+      assert.equal(firstFleetDifference(shared, direct), null);
+    }
+    shared.step(fleetInput(tick)); direct.step(fleetInput(tick));
+    assert.equal(firstFleetDifference(shared, direct), null, `tick ${tick}`);
+    assert.equal(shared.driftReadSnapshot, undefined);
+  }
+  assert.ok(observed.leader > 0 && observed.upstream > 0);
+  assert.ok(observed.entities.size > 1, 'more than one fleet used the shared pass');
+});
+
+test('drone handling ignores a pass for another entity or flow and matches a consistent one', () => {
+  const game = new FleetBattleGame(); game.startFleetBattle(913);
+  for (let tick = 0; tick < 90; tick++) game.step(fleetInput(tick));
+  const p = game.player, b = p.boids[0], other = { id: -1 };
+  const call = (flow, pass) => {
+    const drift = b.drift, owner = b.driftOwner;
+    const result = { ...game.droneHandling(p, b, flow, 1 / 60, .7, pass), drift: b.drift };
+    b.drift = drift; b.driftOwner = owner;
+    return result;
+  };
+  for (const flow of [p, p.boids[1], null]) {
+    const expected = call(flow);
+    const bogus = { flowSpeed: 1e6, cruise: 1, linkRange: 1 };
+    for (const pass of [{ ...bogus, entity: other, flow }, { ...bogus, entity: p, flow: flow === p ? p.boids[1] : p },
+      { ...bogus, entity: null, flow }]) assert.deepStrictEqual(call(flow, pass), expected);
+    const consistent = { entity: p, flow, flowSpeed: flow ? DMath.hypot(flow.vx, flow.vy) : 0,
+      cruise: game.cruiseSpeed(p), linkRange: game.linkRange(p) };
+    assert.deepStrictEqual(call(flow, consistent), expected);
+  }
 });
 
 test('hovering neutral remains age and recruit without moving or calculating neutral neighbours', () => {

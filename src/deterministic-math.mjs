@@ -97,7 +97,30 @@ function sqrt(x) {
   return guess * scale;
 }
 
-function hypot(...values) {
+// The two-number case is the simulation's hot path. It performs the same
+// scaling, +0-started sum and addition order as the general loop below.
+function hypot2(x, y) {
+  const a = Math.abs(x), b = Math.abs(y);
+  if (a === Infinity || b === Infinity) return Infinity;
+  if (Number.isNaN(a) || Number.isNaN(b)) return NaN;
+  const largest = a > b ? a : b;
+  if (largest === 0) return 0;
+  const scaledX = x / largest, scaledY = y / largest;
+  let sum = 0;
+  sum += scaledX * scaledX;
+  sum += scaledY * scaledY;
+  return largest * sqrt(sum);
+}
+
+function hypot() {
+  if (arguments.length === 2) {
+    const x = arguments[0], y = arguments[1];
+    if (typeof x === 'number' && typeof y === 'number') return hypot2(x, y);
+  }
+  return hypotOf(arguments);
+}
+
+function hypotOf(values) {
   let largest = 0;
   let sawNaN = false;
   for (const value of values) {

@@ -100,26 +100,31 @@ export class FleetBattleGame extends Game {
     if (this.fleetBattle && this.state === 'playing') { this.updateFleetSpawns(); this.replenishAmbientDrones(); }
     if (activeFleet) this.canonicalize();
   }
-  droneHandling(entity, b, flow, dt, strain = 0) {
+  // `pass` is the optional updateFlock scratch. It is used only while it belongs
+  // to this same entity and flow; direct callers get the same values computed here.
+  droneHandling(entity, b, flow, dt, strain = 0, pass = null) {
     if (!this.fleetBattle || entity.neutral) {
       if (b.drift) b.drift = 0;
       return super.droneHandling(entity, b, flow, dt);
     }
+    const shared = pass && pass.entity === entity && pass.flow === flow ? pass : null;
     // A recruited or transferred drone never inherits another flock's drift.
     if (b.driftOwner !== entity.id) { b.drift = 0; b.driftOwner = entity.id; }
     const D = FLEET_DRIFT;
-    let target = 0;
+    const flowSpeed = shared ? shared.flowSpeed : flow ? Math.hypot(flow.vx, flow.vy) : 0;
+    let target = 0, cruise;
     if (flow === entity) {
       // Only the commander's actual bank counts: speed times turn rate, never input or a future path.
-      const speed = Math.hypot(flow.vx, flow.vy);
+      const speed = flowSpeed;
+      cruise = shared ? shared.cruise : this.cruiseSpeed(entity);
       const bank = clamp((speed * Math.abs(flow.turnRate || 0) - D.bankStart) / (D.bankFull - D.bankStart), 0, 1);
-      const fast = clamp((speed / this.cruiseSpeed(entity) - D.fastStart) / (D.fastFull - D.fastStart), 0, 1);
+      const fast = clamp((speed / cruise - D.fastStart) / (D.fastFull - D.fastStart), 0, 1);
       target = bank * fast;
-    } else if (flow && (this.driftReadSnapshot?.has(flow)
-      ? this.driftReadSnapshot.get(flow).owner : flow.driftOwner) === entity.id) {
+    } else if (flow) {
       // Farther back the drift travels down the links. An upstream drone's own
       // catch-up swing is recovery, not a new bank, so it never excites more drift.
-      target = this.driftReadSnapshot?.has(flow) ? this.driftReadSnapshot.get(flow).drift : flow.drift;
+      const read = this.driftReadSnapshot?.get(flow);
+      if ((read ? read.owner : flow.driftOwner) === entity.id) target = read ? read.drift : flow.drift;
     }
     b.drift = target > b.drift ? Math.min(target, b.drift + dt / D.rise) : Math.max(target, b.drift - dt / D.decay);
     // Near the reach of its closest local contact a drone takes back full handling,
@@ -127,10 +132,10 @@ export class FleetBattleGame extends Game {
     b.drift = Math.min(b.drift, 1 - clamp((strain - D.strainStart) / (D.strainFull - D.strainStart), 0, 1));
     const P = FLEET_PEDALS;
     let stretch = 0, lag = 0, carry = 0;
-    const flowSpeed = flow ? Math.hypot(flow.vx, flow.vy) : 0;
     if (flowSpeed > 1) {
       // Only observed speeds count, the nearby flow's and this drone's own; never input or a future path.
-      const cruise = this.cruiseSpeed(entity), boostRange = (this.usesPlayerPhysics(entity) ? FLIGHT : ENEMY_FLIGHT).boostMultiplier - 1;
+      if (cruise === undefined) cruise = shared ? shared.cruise : this.cruiseSpeed(entity);
+      const boostRange = (this.usesPlayerPhysics(entity) ? FLIGHT : ENEMY_FLIGHT).boostMultiplier - 1;
       // A fast flow draws a longer wake; a gather seen nearby folds it back in, and
       // near the closest contact's reach the usual wake returns.
       stretch = clamp(((flowSpeed / cruise - 1) / boostRange - P.fastStart) / (P.fastFull - P.fastStart), 0, 1) * (1 - b.gather) *
@@ -145,7 +150,7 @@ export class FleetBattleGame extends Game {
       // so both hand back speed matching while there is still room to recover.
       const dx = b.x - flow.x, dy = b.y - flow.y, gap = Math.hypot(dx, dy) || 1;
       const separating = Math.max(0, (dx * (b.vx - flow.vx) + dy * (b.vy - flow.vy)) / gap);
-      const load = Math.max(strain, (gap + separating * P.anticipate) / (flow === entity ? 155 : this.linkRange(entity)));
+      const load = Math.max(strain, (gap + separating * P.anticipate) / (flow === entity ? 155 : shared ? shared.linkRange : this.linkRange(entity)));
       const hold = 1 - clamp((load - P.holdStart) / (P.holdFull - P.holdStart), 0, 1);
       lag *= hold; carry *= hold;
     }

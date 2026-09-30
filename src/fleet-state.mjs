@@ -23,26 +23,67 @@ const fail = (path, reason) => { throw new TypeError(`${path}: ${reason}`); };
 const safeKey = k => k !== '__proto__' && k !== 'prototype' && k !== 'constructor';
 function bits(n) { f64.setFloat64(0, n, false); return f64.getBigUint64(0, false).toString(16).padStart(16, '0'); }
 function fromBits(hex) { f64.setBigUint64(0, BigInt(`0x${hex}`), false); return f64.getFloat64(0, false); }
-function encode(value, path = '$', depth = 0) {
-  if (depth > MAX_DEPTH) fail(path, 'record too deep');
-  if (typeof value === 'string' && value.length > 4096) fail(path, 'string too large');
+function tagNumber(hex, path) {
+  if (typeof hex !== 'string' || !/^[0-9a-f]{16}$/.test(hex)) fail(path, 'invalid Float64 tag');
+  const number = fromBits(hex);
+  if (Number.isNaN(number)) fail(path, 'NaN is not authoritative state');
+  return number;
+}
+// The live walks track the path as a key stack (depth === trail.length) and only
+// format it on failure, instead of building a string for every node.
+const pathText = trail => trail.reduce((path, key) => typeof key === 'number' ? `${path}[${key}]` : `${path}.${key}`, '$');
+function visit(walk, value, trail, key) { trail.push(key); const result = walk(value, trail); trail.pop(); return result; }
+function encode(value, trail = []) {
+  if (trail.length > MAX_DEPTH) fail(pathText(trail), 'record too deep');
+  if (typeof value === 'string' && value.length > 4096) fail(pathText(trail), 'string too large');
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'number') {
-    if (Number.isNaN(value)) fail(path, 'NaN is not authoritative state');
+    if (Number.isNaN(value)) fail(pathText(trail), 'NaN is not authoritative state');
     return !Number.isFinite(value) || Object.is(value, -0) ? { $f64: bits(value) } : value;
   }
   if (Array.isArray(value)) {
-    if (value.length > MAX_DRONES) fail(path, 'array too large');
-    return value.map((v, i) => encode(v, `${path}[${i}]`, depth + 1));
+    if (value.length > MAX_DRONES) fail(pathText(trail), 'array too large');
+    return value.map((v, i) => visit(encode, v, trail, i));
   }
-  if (!value || Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) fail(path, 'expected plain data');
-  if (Object.keys(value).length > 128) fail(path, 'record too large');
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) fail(pathText(trail), 'expected plain data');
+  const keys = Object.keys(value);
+  if (keys.length > 128) fail(pathText(trail), 'record too large');
   const result = {};
-  for (const key of Object.keys(value).sort()) {
-    if (!safeKey(key) || typeof value[key] === 'undefined' || typeof value[key] === 'function' || typeof value[key] === 'symbol') fail(`${path}.${key}`, 'unsafe or unsupported value');
-    result[key] = encode(value[key], `${path}.${key}`, depth + 1);
+  for (const key of keys.sort()) {
+    const v = value[key];
+    if (!safeKey(key) || typeof v === 'undefined' || typeof v === 'function' || typeof v === 'symbol') fail(pathText([...trail, key]), 'unsafe or unsupported value');
+    result[key] = visit(encode, v, trail, key);
   }
   return result;
+}
+// Live capture used to run decode(encode(source)) before validation. This is
+// the same walk in one detached copy: encode's checks on every node, then
+// decode's handling of a resulting single-key {$f64} record. Keys are left in
+// source order because the final encode in canonicalize() sorts them.
+function normalize(value, trail = []) {
+  if (trail.length > MAX_DEPTH) fail(pathText(trail), 'record too deep');
+  if (typeof value === 'string' && value.length > 4096) fail(pathText(trail), 'string too large');
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (Number.isNaN(value)) fail(pathText(trail), 'NaN is not authoritative state');
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_DRONES) fail(pathText(trail), 'array too large');
+    return value.map((v, i) => visit(normalize, v, trail, i));
+  }
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) fail(pathText(trail), 'expected plain data');
+  const keys = Object.keys(value);
+  if (keys.length > 128) fail(pathText(trail), 'record too large');
+  const result = {};
+  for (const key of keys) {
+    const v = value[key];
+    if (!safeKey(key) || typeof v === 'undefined' || typeof v === 'function' || typeof v === 'symbol') fail(pathText([...trail, key]), 'unsafe or unsupported value');
+    result[key] = visit(normalize, v, trail, key);
+  }
+  // A nested tag or special number normalizes to a number here, so it fails
+  // the string check exactly as decode rejected encode's nested tag.
+  return keys.length === 1 && keys[0] === '$f64' ? tagNumber(result.$f64, pathText(trail)) : result;
 }
 function decode(value, path = '$', depth = 0) {
   if (depth > MAX_DEPTH) fail(path, 'record too deep');
@@ -56,12 +97,7 @@ function decode(value, path = '$', depth = 0) {
   if (!value || Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) fail(path, 'expected JSON object');
   const keys = Object.keys(value);
   if (keys.length > 128) fail(path, 'record too large');
-  if (keys.length === 1 && keys[0] === '$f64') {
-    if (typeof value.$f64 !== 'string' || !/^[0-9a-f]{16}$/.test(value.$f64)) fail(path, 'invalid Float64 tag');
-    const number = fromBits(value.$f64);
-    if (Number.isNaN(number)) fail(path, 'NaN is not authoritative state');
-    return number;
-  }
+  if (keys.length === 1 && keys[0] === '$f64') return tagNumber(value.$f64, path);
   const result = {};
   for (const key of keys) {
     if (!safeKey(key)) fail(`${path}.${key}`, 'unsafe key');
@@ -195,8 +231,10 @@ function checkState(state) {
   }
   return state;
 }
-function canonical(state) {
-  const s = encode(checkState(decode(state)));
+function canonical(snapshot) { return canonicalize(decode(snapshot)); }
+// Validates decoded state and returns a detached, key-sorted, ID-ordered copy.
+function canonicalize(state) {
+  const s = encode(checkState(state));
   s.entities.sort((a, b) => a.id - b.id);
   for (const e of s.entities) e.boids.sort((a, b) => a.id - b.id);
   s.strays.sort((a, b) => a.id - b.id); s.food.sort((a, b) => a.id - b.id);
@@ -215,7 +253,7 @@ export function captureFleetState(game) {
     pendingMembershipChecks: [...game.pendingMembershipChecks].map(e => e.id),
   };
   if (game.choices.length) fail('$.choices', 'fleet upgrades are unsupported');
-  return canonical(encode(source));
+  return canonicalize(normalize(source));
 }
 export function restoreFleetState(game, snapshot) {
   if (!game || typeof game.reset !== 'function' || typeof game.startFleetBattle !== 'function' || typeof game.collisionGrid?.constructor !== 'function') fail('$game', 'FleetBattleGame required');

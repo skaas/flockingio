@@ -33,6 +33,11 @@ export function movingCirclesHit(a, b, radius) {
 const gridRows = new WeakMap();
 // Influence bounds describe only the immutable pre-movement influence snapshot.
 const influenceBounds = new WeakMap();
+// Reusable scratch for one updateFlock pass. Its values are derived from positions,
+// velocities and rules that stay immutable until every bird has decided, and
+// `entity` is cleared when the pass ends so a stale pass never matches.
+const flowPasses = new WeakMap();
+const makeFlowPass = () => ({ entity: null, flow: null, flowSpeed: 0, cruise: 0, linkRange: 0, drift: new Map(), driftRecords: [] });
 
 export class SpatialGrid {
   constructor(size = 55) { this.size = size; this.cells = new Map(); this.cellPool = []; gridRows.set(this, new Map()); }
@@ -739,13 +744,43 @@ export class Game {
     if (entity.neutral) {
       grid.clear(); for (const b of entity.boids) grid.add(b);
     } else if (!connectionsReady) this.connectedFlock(entity);
-    const previousDriftSnapshot = this.driftReadSnapshot;
-    if (this.fleetBattle) this.driftReadSnapshot = new Map(entity.boids.map(b => [b, { drift: b.drift || 0, owner: b.driftOwner }]));
+    // Values shared by every bird of this pass, evaluated with the same operands and order.
+    const roundingMargin = 1 + 1e-12;
+    const contactRange2 = contactRange * contactRange * roundingMargin;
+    const separationBase = 29 * (1 + s.separation * .18);
+    const influenceRate = dt * (entity.neutral ? .65 : .34 / (1 + s.cohesion * .12));
+    const headGrowth = entity.neutral ? 0 : Math.max(0, entity.radius - (this.usesPlayerPhysics(entity) ? HEAD_GROWTH.baseRadius : 12));
+    const headClearance = 30 + headGrowth * 1.25, headRepel = 220 + headGrowth * 20;
+    const cohesionBase = 1.7 * (1 + s.cohesion * .24), alignmentBase = 3.6 * (1 + s.alignment * .3);
+    const wanderPhase = this.elapsed * .83, wanderPhase2 = this.elapsed * 1.73;
+    const speedLimit = entity.neutral ? 2.15 : FLIGHT.boostMultiplier + .4;
+    const minSpeed = cruise * .2, maxSpeed = cruise * speedLimit;
+    const gatherRate = entity.neutral ? 0 : 1 - Math.exp(-dt * 6);
+    const leaderSpeed = entity.neutral ? 0 : Math.hypot(entity.vx, entity.vy), leaderFlowSpeed = leaderSpeed || 1;
+    const leaderForwardX = entity.neutral ? 0 : entity.vx / leaderFlowSpeed, leaderForwardY = entity.neutral ? 0 : entity.vy / leaderFlowSpeed;
+    const leaderSteadiness = entity.neutral ? 0 : 1 - clamp(Math.abs(entity.turnRate || 0) / .9, 0, .9);
+    const birdRadius = 5 * (1 + s.separation * .04);
     // Positions and velocities stay immutable until every bird has decided.
     // There is no formation index, rotating frame, path, or assigned destination.
     const updates = entity.flockUpdates || (entity.flockUpdates = []);
     const nearCells = [];
+    // A nested pass never shares the outer pass's scratch.
+    let pass = flowPasses.get(this);
+    if (!pass) flowPasses.set(this, pass = makeFlowPass());
+    else if (pass.entity) pass = makeFlowPass();
+    const previousDriftSnapshot = this.driftReadSnapshot;
     try {
+    pass.entity = entity; pass.flow = null; pass.flowSpeed = 0; pass.cruise = cruise; pass.linkRange = contactRange;
+    if (this.fleetBattle) {
+      // Drift is read from pre-pass values; records are refilled for every pass.
+      const records = pass.driftRecords;
+      for (let i = 0; i < entity.boids.length; i++) {
+        const b = entity.boids[i], read = records[i] || (records[i] = { drift: 0, owner: undefined });
+        read.drift = b.drift || 0; read.owner = b.driftOwner;
+        pass.drift.set(b, read);
+      }
+      this.driftReadSnapshot = pass.drift;
+    }
     for (let birdIndex = 0; birdIndex < entity.boids.length; birdIndex++) {
       const b = entity.boids[birdIndex];
       // Hovering remains are still recruitable, but never use neutral flocking.
@@ -766,7 +801,7 @@ export class Game {
         }
         continue;
       }
-      const separationRadius = 29 * (1 + s.separation * .18) * (1 - b.gather * .32);
+      const separationRadius = separationBase * (1 - b.gather * .32);
       const vision = b.vision, forwardX = Math.cos(b.angle), forwardY = Math.sin(b.angle);
       let sepX = 0, sepY = 0, sumX = 0, sumY = 0, alignX = 0, alignY = 0, weight = 0, gatherSum = 0, gatherWeight = 0;
       let upstreamBird = null, upstreamDistance = Infinity, upstreamDistance2 = Infinity;
@@ -774,10 +809,8 @@ export class Game {
       const neighborRecords = b.neighborRecords || (b.neighborRecords = []);
       let neighborCount = 0;
       const searchRadius = Math.max(vision, contactRange);
-      const roundingMargin = 1 + 1e-12;
       const searchRadius2 = searchRadius * searchRadius * roundingMargin;
       const separationRadius2 = separationRadius * separationRadius * roundingMargin;
-      const contactRange2 = contactRange * contactRange * roundingMargin;
       grid.cellsNear(b.x, b.y, searchRadius, nearCells);
       for (let cellIndex = 0; cellIndex < nearCells.length; cellIndex++) {
         const cell = nearCells[cellIndex];
@@ -847,7 +880,7 @@ export class Game {
       if (rival) {
         if (b.influenceTarget !== rival.id) b.influence = 0;
         b.influenceTarget = rival.id;
-        b.influence = Math.min(1, b.influence + dt * (entity.neutral ? .65 : .34 / (1 + s.cohesion * .12)) * clamp(rival.ratio - .65, .5, 1.4));
+        b.influence = Math.min(1, b.influence + influenceRate * clamp(rival.ratio - .65, .5, 1.4));
       } else {
         b.influence = Math.max(0, b.influence - dt * .7);
         // A one-frame gap should decay exposure, not erase the identity and
@@ -859,30 +892,38 @@ export class Game {
       const loyalty = 1 - b.influence * .85;
       sumX *= loyalty; sumY *= loyalty; alignX *= loyalty; alignY *= loyalty; weight *= loyalty;
       // Only birds close enough to see the leader respond to it directly.
-      const seesLeader = headDistance < Math.max(155, vision * 1.65);
+      const leaderSight = Math.max(155, vision * 1.65);
+      const seesLeader = headDistance < leaderSight;
       const flow = seesLeader ? entity : upstreamBird;
-      const flowSpeed = flow ? Math.hypot(flow.vx, flow.vy) || 1 : 1;
-      const flowForwardX = flow ? flow.vx / flowSpeed : 0, flowForwardY = flow ? flow.vy / flowSpeed : 0;
+      // The leader's flow values are shared by the pass; an upstream bird's are its own.
+      let rawFlowSpeed = 0, flowSpeed = 1, flowForwardX = 0, flowForwardY = 0, flowSteadiness = 0;
+      if (seesLeader) {
+        rawFlowSpeed = leaderSpeed; flowSpeed = leaderFlowSpeed;
+        flowForwardX = leaderForwardX; flowForwardY = leaderForwardY; flowSteadiness = leaderSteadiness;
+      } else if (flow) {
+        rawFlowSpeed = Math.hypot(flow.vx, flow.vy); flowSpeed = rawFlowSpeed || 1;
+        flowForwardX = flow.vx / flowSpeed; flowForwardY = flow.vy / flowSpeed;
+        flowSteadiness = 1 - clamp(Math.abs(flow.turnRate || 0) / .9, 0, .9);
+      }
       // A fast bank may briefly outrun a drone's handling; flocking still brings it back.
       // Strain is how near its closest local contact, head or upstream drone, is to reach.
       const strain = entity.neutral ? 0 : Math.min(headDistance / 155, upstreamDistance / contactRange);
-      const handling = this.droneHandling(entity, b, flow, dt, strain);
+      pass.flow = flow; pass.flowSpeed = rawFlowSpeed;
+      const handling = this.droneHandling(entity, b, flow, dt, strain, pass);
       const flowX = flow ? flow.x - b.x : 0, flowY = flow ? flow.y - b.y : 0;
-      const headGrowth = entity.neutral ? 0 : Math.max(0, entity.radius - (this.usesPlayerPhysics(entity) ? HEAD_GROWTH.baseRadius : 12));
       const leadGap = (seesLeader ? 42 * (1 - b.gather * .25) + headGrowth : separationRadius * .75) * handling.wake;
       const across = flowX * flowForwardY - flowY * flowForwardX;
       const wakeGap = leadGap + Math.abs(across) * (seesLeader ? .9 : .6);
       // A wake is useful while traveling together. During a bend, let alignment
       // lead the turn before the trailing fan reforms; do not rotate a template.
-      const streaming = flow ? clamp((flowForwardX * forwardX + flowForwardY * forwardY - .6) / .35, 0, 1) *
-        (1 - clamp(Math.abs(flow.turnRate || 0) / .9, 0, .9)) : 0;
+      const streaming = flow ? clamp((flowForwardX * forwardX + flowForwardY * forwardY - .6) / .35, 0, 1) * flowSteadiness : 0;
       // Retain most of the bird's current lateral offset, with a soft bias back
       // toward the flow so an initially one-sided group can spread on both sides.
       const lateralRetention = seesLeader ? .65 : .9;
       const wakeX = flowX - (flowForwardX * wakeGap + flowForwardY * across * lateralRetention) * streaming;
       const wakeY = flowY - (flowForwardY * wakeGap - flowForwardX * across * lateralRetention) * streaming;
       if (flow) {
-        const w = (seesLeader ? 7 * (1 - headDistance / Math.max(155, vision * 1.65)) : 1.8) * loyalty;
+        const w = (seesLeader ? 7 * (1 - headDistance / leaderSight) : 1.8) * loyalty;
         // Follow the flow behind the head, not its center. There is no assigned
         // bird position; local separation and neighbors still determine the shape.
         sumX += (b.x + wakeX) * w; sumY += (b.y + wakeY) * w;
@@ -893,9 +934,8 @@ export class Game {
         const w = b.influence * 6;
         sumX += rival.x * w; sumY += rival.y * w; alignX += rival.vx * w; alignY += rival.vy * w; weight += w;
       }
-      const headClearance = 30 + headGrowth * 1.25;
       if (headDistance < headClearance && headDistance > .001) {
-        const repel = (1 - headDistance / headClearance) * (220 + headGrowth * 20);
+        const repel = (1 - headDistance / headClearance) * headRepel;
         sepX -= headX / headDistance * repel; sepY -= headY / headDistance * repel;
       }
       let ax = sepX, ay = sepY;
@@ -919,7 +959,7 @@ export class Game {
         ax += dx / d * pull; ay += dy / d * pull;
       }
       if (weight > 0) {
-        const cohesion = 1.7 * (1 + s.cohesion * .24) * (1 + b.gather * .8), alignment = 3.6 * (1 + s.alignment * .3) * handling.alignment;
+        const cohesion = cohesionBase * (1 + b.gather * .8), alignment = alignmentBase * handling.alignment;
         ax += (sumX / weight - b.x) * cohesion + (alignX / weight - b.vx) * alignment;
         ay += (sumY / weight - b.y) * cohesion + (alignY / weight - b.vy) * alignment;
       }
@@ -929,20 +969,19 @@ export class Game {
       const observedSpeed = weight > 0 ? Math.hypot(alignX / weight, alignY / weight) : speed;
       const desiredSpeed = observedSpeed * (entity.neutral ? b.pace : .94 + (b.pace - 1) * .3);
       ax += forwardX * (desiredSpeed - speed) * .9 * handling.pace; ay += forwardY * (desiredSpeed - speed) * .9 * handling.pace;
-      const wander = (Math.sin(this.elapsed * .83 + b.seed) + .5 * Math.sin(this.elapsed * 1.73 + b.seed * 2.1)) * 8;
+      const wander = (Math.sin(wanderPhase + b.seed) + .5 * Math.sin(wanderPhase2 + b.seed * 2.1)) * 8;
       ax -= forwardY * wander; ay += forwardX * wander;
       const edge = Math.hypot(b.x, b.y);
       if (edge > WORLD_RADIUS - 60) { const force = Math.min(160, (edge - WORLD_RADIUS + 60) * 2); ax -= b.x / edge * force; ay -= b.y / edge * force; }
       const acceleration = Math.hypot(ax, ay), maxAcceleration = 260 * b.agility * growthSpeed;
       if (acceleration > maxAcceleration) { ax *= maxAcceleration / acceleration; ay *= maxAcceleration / acceleration; }
       const vx = b.vx + ax * dt, vy = b.vy + ay * dt;
-      const speedLimit = entity.neutral ? 2.15 : FLIGHT.boostMultiplier + .4;
-      const nextSpeed = clamp(Math.hypot(vx, vy), cruise * .2, cruise * speedLimit);
+      const nextSpeed = clamp(Math.hypot(vx, vy), minSpeed, maxSpeed);
       // A crowded drone keeps its full yaw, so reduced handling never forces an overlap.
       const crowding = clamp(Math.hypot(sepX, sepY) / 235, 0, 1);
       const turn = 3 * b.agility * dt * lerp(handling.yaw, 1, crowding);
       const angle = b.angle + clamp(angleDelta(b.angle, Math.atan2(vy, vx)), -turn, turn);
-      const gather = entity.neutral ? 0 : lerp(b.gather, gatherWeight ? gatherSum / gatherWeight : 0, 1 - Math.exp(-dt * 6));
+      const gather = entity.neutral ? 0 : lerp(b.gather, gatherWeight ? gatherSum / gatherWeight : 0, gatherRate);
       const next = updates[birdIndex] || (updates[birdIndex] = {});
       next.vx = Math.cos(angle) * nextSpeed; next.vy = Math.sin(angle) * nextSpeed;
       next.gather = gather; next.turnRate = dt ? (angle - b.angle) / dt : 0;
@@ -955,10 +994,13 @@ export class Game {
       b.gather = next.gather;
       b.turnRate = next.turnRate;
       b.x += b.vx * dt; b.y += b.vy * dt;
-      b.angle = Math.atan2(b.vy, b.vx); b.radius = 5 * (1 + s.separation * .04);
+      b.angle = Math.atan2(b.vy, b.vx); b.radius = birdRadius;
       if (!b.trail.length || distance2(b, b.trail[0]) > 7 ** 2) { b.trail.unshift({ x: b.x, y: b.y }); if (b.trail.length > 7) b.trail.pop(); }
     }
-    } finally { this.driftReadSnapshot = previousDriftSnapshot; }
+    } finally {
+      this.driftReadSnapshot = previousDriftSnapshot;
+      pass.entity = null; pass.flow = null; pass.drift.clear();
+    }
   }
   buildCollisionGrid() {
     this.collisionGrid.clear();

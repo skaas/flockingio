@@ -70,6 +70,51 @@ test('transcendental operations never call host transcendental helpers', () => {
   }
 });
 
+// The general algorithm as it was before the two-number path, kept as an oracle.
+function referenceHypot(...values) {
+  let largest = 0;
+  let sawNaN = false;
+  for (const value of values) {
+    const a = Math.abs(value);
+    if (a === Infinity) return Infinity;
+    if (Number.isNaN(a)) sawNaN = true;
+    if (a > largest) largest = a;
+  }
+  if (sawNaN) return NaN;
+  if (largest === 0) return 0;
+  let sum = 0;
+  for (const value of values) {
+    const scaled = value / largest;
+    sum += scaled * scaled;
+  }
+  return largest * DMath.sqrt(sum);
+}
+
+test('hypot is bit-identical to the general algorithm for every arity', () => {
+  const same = args => {
+    const actual = DMath.hypot(...args), expected = referenceHypot(...args);
+    assert.ok(Object.is(actual, expected), `hypot(${args.map(String).join(', ')}) = ${actual}, expected ${expected}`);
+  };
+  const rng = seededRandom(0x68797074);
+  for (let i = 0; i < 20000; i++) {
+    const scale = [1e-3, 1, 60, 400, 2400][i % 5];
+    same([(rng() * 2 - 1) * scale, (rng() * 2 - 1) * scale]);
+  }
+  const edges = [0, -0, Number.MIN_VALUE, -Number.MIN_VALUE, 2.2250738585072014e-308, 1e-310, 1e-160, .001, .5, 1, 3, 4,
+    1e150, 1e200, 1.7976931348623157e308, -1.7976931348623157e308, Infinity, -Infinity, NaN];
+  for (const x of edges) {
+    same([x]);
+    for (const y of edges) {
+      same([x, y]);
+      same([x, y, 3]);
+      same([NaN, x, y]);
+    }
+  }
+  same([]); same([3, 4, 5, 6]); same([1e308, 1e308, 1e308]);
+  for (const args of [[undefined, 1], [1, undefined], ['3', 4], [3, '4'], [null, -0], [true, 2], [{ valueOf: () => 5 }, 12]]) same(args);
+  assert.equal(DMath.hypot.length, 0);
+});
+
 test('RNG matches replay LCG and restores snapshots', () => {
   const rng = seededRandom(123456789);
   let state = 123456789;

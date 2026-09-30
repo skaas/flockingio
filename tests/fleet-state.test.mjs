@@ -8,6 +8,15 @@ const make = seed => { const game = new FleetBattleGame(); game.startFleetBattle
 const input = tick => ({ dx: Math.cos(tick * .014), dy: Math.sin(tick * .014), boost: tick % 240 < 24, gather: tick % 190 > 160 });
 const advance = (game, begin, count) => { for (let i = begin; i < begin + count; i++) game.step(input(i)); };
 const clone = value => JSON.parse(JSON.stringify(value));
+// Independent reference for the canonical wire form: Float64 tags for -0 and
+// infinities, lexically sorted keys, and the original FNV-1a over UTF-16 units.
+const view = new DataView(new ArrayBuffer(8));
+const tag = n => { view.setFloat64(0, n); return { $f64: view.getBigUint64(0).toString(16).padStart(16, '0') }; };
+const untag = v => { view.setBigUint64(0, BigInt(`0x${v.$f64}`)); return view.getFloat64(0); };
+const refDecode = v => Array.isArray(v) ? v.map(refDecode) : v && typeof v === 'object' ? (Object.keys(v).join() === '$f64' ? untag(v) : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, refDecode(x)]))) : v;
+const refEncode = v => typeof v === 'number' ? (!Number.isFinite(v) || Object.is(v, -0) ? tag(v) : v) : Array.isArray(v) ? v.map(refEncode) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map(k => [k, refEncode(v[k])])) : v;
+const refHash = text => { let h = 0x811c9dc5; for (let i = 0; i < text.length; i++) { const u = text.charCodeAt(i); h ^= u & 255; h = Math.imul(h, 0x01000193) >>> 0; h ^= u >>> 8; h = Math.imul(h, 0x01000193) >>> 0; } return h; };
+const byId = list => list.every((x, i) => i === 0 || list[i - 1].id < x.id);
 
 test('warmed fleet checkpoint resumes through AI, spawns, recruitment and ambient refill', () => {
   const original = make(0x109ad);
@@ -109,6 +118,127 @@ test('first boosted tick and injected RNG with unknown starting seed roundtrip',
   game.step({ dx: 1, dy: 0, boost: true });
   restored.step({ dx: 1, dy: 0, boost: true });
   assert.equal(firstFleetDifference(game, restored), null);
+});
+
+test('live capture bytes and fingerprints match the checkpoint path and reference encoding', () => {
+  for (const [seed, ticks] of [[0x21, 0], [0x5eed, 150], [0x109ad, 420]]) {
+    const game = make(seed);
+    advance(game, 0, ticks);
+    game.entities.reverse(); game.strays.reverse();
+    const text = serializeFleetState(game), state = JSON.parse(text);
+    // The checkpoint path still runs the original decode -> validate -> encode.
+    assert.equal(serializeFleetState(state), text);
+    assert.equal(JSON.stringify(refEncode(refDecode(state))), text);
+    assert.equal(fleetFingerprint(game), refHash(text));
+    assert.equal(fleetFingerprint(state), refHash(text));
+    assert.ok(byId(state.entities) && byId(state.strays) && byId(state.food) && state.entities.every(e => byId(e.boids)));
+    assert.deepEqual(state.pendingMembershipChecks, [...state.pendingMembershipChecks].sort((a, b) => a - b));
+  }
+});
+
+test('live -0, infinities and raw Float64 tags normalize exactly as before', () => {
+  const game = make(0x3a1);
+  advance(game, 0, 30);
+  const liveTag = { $f64: '3ff8000000000000' };
+  game.player.turnRate = -0;
+  game.fleetSpawnAt = -Infinity;
+  game.player.targetHeading = liveTag;
+  game.player.boids[0].drift = { $f64: '8000000000000000' };
+  game.player.boids[0].linkDepth = { $f64: '7ff0000000000000' };
+  const state = captureFleetState(game), player = state.entities.find(e => e.player);
+  assert.deepEqual(player.turnRate, { $f64: '8000000000000000' });
+  assert.deepEqual(state.game.fleetSpawnAt, { $f64: 'fff0000000000000' });
+  assert.equal(player.targetHeading, 1.5);
+  const drone = player.boids.find(b => b.id === game.player.boids[0].id);
+  assert.deepEqual(drone.drift, { $f64: '8000000000000000' });
+  assert.deepEqual(drone.linkDepth, { $f64: '7ff0000000000000' });
+  assert.deepEqual(liveTag, { $f64: '3ff8000000000000' });
+  const text = JSON.stringify(state);
+  assert.equal(serializeFleetState(game), text);
+  assert.equal(serializeFleetState(JSON.parse(text)), text);
+  assert.equal(JSON.stringify(refEncode(refDecode(state))), text);
+  const resumed = restoreFleetState(new FleetBattleGame(), JSON.parse(text));
+  assert.ok(Object.is(resumed.player.turnRate, -0));
+  assert.equal(resumed.fleetSpawnAt, -Infinity);
+  assert.equal(serializeFleetState(resumed), text);
+});
+
+test('malformed live state is still rejected without mutating the game', () => {
+  const game = make(0x6b);
+  advance(game, 0, 60);
+  const before = serializeFleetState(game), rng = game.random.state();
+  const deep = [[[[[[[[[1]]]]]]]]];
+  const corruptions = [
+    [() => game.player, 'x', NaN],
+    [() => game.player, 'x', { $f64: '7ff8000000000000' }],
+    [() => game.player, 'x', { $f64: '7ff0000000000000' }],
+    [() => game.player, 'x', { $f64: 'not-a-float64tag' }],
+    [() => game.player, 'x', { $f64: 1 }],
+    [() => game.player, 'x', { $f64: Infinity }],
+    [() => game.player, 'x', { $f64: { $f64: '3ff0000000000000' } }],
+    [() => game.player, 'x', 1n],
+    [() => game.player, 'x', undefined],
+    [() => game.player, 'intent', () => 'x'],
+    [() => game.player, 'unlistedField', 1],
+    [() => game.player, 'target', { $f64: '3ff0000000000000' }],
+    [() => game.player.control, 'heading', deep],
+    [() => game.player.control, 'extra', new Map()],
+    [() => game.player.target, 'x', Symbol('x')],
+    [() => game.player.boids[0], 'owner', 99999],
+    [() => game.player.boids[0], 'radius', 0],
+    [() => game.stats, 'bogus', 1],
+    [() => game.stats, 'boost', -1],
+    [() => game, 'nextId', 0],
+    [() => game, 'ambientPhase', [0, Infinity]],
+  ];
+  for (const [owner, key, value] of corruptions) {
+    const target = owner(), had = Object.hasOwn(target, key), old = target[key];
+    target[key] = value;
+    assert.throws(() => captureFleetState(game), TypeError, key);
+    assert.throws(() => fleetFingerprint(game), TypeError, key);
+    if (had) target[key] = old; else delete target[key];
+    assert.equal(serializeFleetState(game), before);
+    assert.equal(game.random.state(), rng);
+  }
+  const unsafe = JSON.parse('{"__proto__": 1, "heading": 0}');
+  const control = game.player.control;
+  game.player.control = unsafe;
+  assert.throws(() => captureFleetState(game), TypeError);
+  game.player.control = control;
+  assert.equal(serializeFleetState(game), before);
+});
+
+test('capture output is detached and reusable mutable input is read fresh each time', () => {
+  const game = make(0x1d7);
+  advance(game, 0, 45);
+  const order = game.entities.map(e => e.id), keys = Object.keys(game.player), controlKeys = Object.keys(game.player.control);
+  game.entities.reverse();
+  const reversed = game.entities.map(e => e.id);
+  const first = captureFleetState(game), text = JSON.stringify(first), hash = fleetFingerprint(game);
+  assert.deepEqual(game.entities.map(e => e.id), reversed);
+  game.entities.reverse();
+  assert.deepEqual(game.entities.map(e => e.id), order);
+  assert.deepEqual(Object.keys(game.player), keys);
+  assert.deepEqual(Object.keys(game.player.control), controlKeys);
+  const player = first.entities.find(e => e.player);
+  assert.notEqual(player.control, game.player.control);
+  assert.notEqual(player.target, game.player.target);
+  assert.notEqual(first.game.stats, game.stats);
+  assert.notEqual(first.game.ambientPhase, game.ambientPhase);
+  player.control.heading += 1; player.target.x += 1; first.game.stats.boost += 1; first.game.ambientPhase[0] += 1;
+  first.game.duration.$f64 = '0000000000000000'; player.boids[0].x += 1;
+  assert.equal(serializeFleetState(game), text);
+  assert.equal(fleetFingerprint(game), hash);
+  const heading = game.player.control.heading, phase = game.ambientPhase[1];
+  game.player.control.heading = heading + .25; game.stats.boost += 1; game.ambientPhase[1] = phase + .5;
+  const second = captureFleetState(game), again = second.entities.find(e => e.player);
+  assert.equal(again.control.heading, heading + .25);
+  assert.equal(second.game.stats.boost, JSON.parse(text).game.stats.boost + 1);
+  assert.notEqual(fleetFingerprint(game), hash);
+  assert.equal(JSON.parse(text).entities.find(e => e.player).control.heading, heading);
+  game.player.control.heading = heading; game.stats.boost -= 1; game.ambientPhase[1] = phase;
+  assert.equal(serializeFleetState(game), text);
+  assert.equal(fleetFingerprint(game), hash);
 });
 
 test('bad checkpoints fail without changing an already used target or its RNG', () => {
