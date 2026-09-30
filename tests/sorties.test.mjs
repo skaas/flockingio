@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Game, MAX_FLOCK } from '../src/engine.mjs';
+import { SORTIE_BALANCE } from '../src/rules.mjs';
+import { Game, MAX_FLOCK, UPGRADES } from '../src/engine.mjs';
 import { FIRE_SUPPORT, requestCoordinates } from '../src/bombardment.mjs';
 import { seededRandom, REPLAY_STEP } from '../src/replay.mjs';
 
@@ -51,24 +52,24 @@ test('salvage funds choices while only the reinforcement choice adds new player 
     assert.equal(game.levelUp(), true);
     assert.deepEqual(game.choices.map(u => u.id), ['growth']);
     assert.equal(game.player.boids.length, 4, 'opening the menu does not reinforce');
-    assert.equal(game.chooseUpgrade(0), true); assert.equal(game.player.boids.length, 6);
+    assert.equal(game.chooseUpgrade(0), true); assert.equal(game.player.boids.length, 8);
     assert.equal(game.chooseUpgrade(0), false, 'a repeated click cannot add drones');
     const xp = game.xp;
     game.addFood({ x: 0, y: 0 }, 240); game.collectFood(REPLAY_STEP);
-    assert.equal(game.player.boids.length, 6); assert.equal(game.maxFlock, 6);
+    assert.equal(game.player.boids.length, 8); assert.equal(game.maxFlock, 8);
     assert.equal(game.xp, xp + 240, 'reinforcement no longer also boosts salvage XP');
   }
 });
 
-test('six reinforcement choices can grow the initial four drones to sixteen and reset next sortie', () => {
+test('three reinforcement choices can grow the initial four drones to sixteen and reset next sortie', () => {
   const { game } = sortie();
-  for (let level = 1; level <= 6; level++) {
+  for (let level = 1; level <= 3; level++) {
     for (const u of game.upgrades) if (u.id !== 'growth') game.stats[u.id] = u.max;
     game.xp = game.nextXp;
     assert.equal(game.levelUp(), true);
     assert.deepEqual(game.choices.map(u => u.id), ['growth']);
     assert.equal(game.chooseUpgrade(0), true);
-    assert.equal(game.player.boids.length, 4 + level * 2);
+    assert.equal(game.player.boids.length, 4 + level * 4);
     assert.equal(game.stats.growth, level);
   }
   assert.equal(game.maxFlock, MAX_FLOCK);
@@ -111,7 +112,7 @@ test('orders repeat one at a time after confirmed destruction, with one reward a
     const pending = war.requests.filter(r => r.state !== 'complete');
     assert.equal(pending.length, 1);
     const target = pending[0]; assert.equal(target.id, mission); assert.equal(target.kind, (mission - 1) % 3);
-    assert.equal(target.durability, Math.min(220, 100 + Math.floor((mission - 1) / 3) * 40));
+    assert.equal(target.durability, SORTIE_BALANCE[game.difficulty()].durability);
     Object.assign(game.player, { x: target.x + 100, y: target.y });
     for (const b of game.player.boids) { b.x = target.x; b.y = target.y; }
     for (let i = 0; i < 600 && target.state !== 'complete'; i++) stepWar(game, 1);
@@ -133,7 +134,7 @@ test('orders repeat one at a time after confirmed destruction, with one reward a
   assert.equal(game.bombardment.requests[0].id, 1);
 });
 
-test('four drones complete the first flyover while the commander accelerates out of predicted fire', () => {
+test('a basic first flyover damages the tougher battery but leaves a second attack to finish it', () => {
   for (const seed of [11, 17, 42, 77]) {
     const { game } = sortie(seed);
     let lockedAt = null;
@@ -142,30 +143,45 @@ test('four drones complete the first flyover while the commander accelerates out
       game.update(REPLAY_STEP, { boost: lockedAt !== null && game.elapsed - lockedAt > .25 && game.elapsed - lockedAt < 2.7 });
     }
     assert.notEqual(lockedAt, null);
-    assert.equal(game.state, 'playing'); assert.equal(game.bombardment.completed, 1);
-    assert.ok(game.bombardment.craters.length >= 1);
+    assert.equal(game.state, 'playing'); assert.equal(game.bombardment.completed, 0);
+    const battery = game.bombardment.requests[0];
+    assert.equal(battery.damage, 120); assert.equal(battery.durability, 160);
+    assert.equal(game.bombardment.craters.length, 0);
   }
 });
 
-test('flying straight through a straight-line solution is dangerous even after destroying the battery', () => {
+test('flying straight into final-phase predicted fire kills the commander', () => {
   for (const seed of [11, 77]) {
-    const { game, events } = sortie(seed);
+    const { game, events } = sortie(seed); game.elapsed = 255; game.phase = 5;
+    game.entities = [game.player]; game.spawnTimer = Infinity; game.dispatchInterception = () => null;
+    game.bombardment.requests[0].durability = SORTIE_BALANCE[5].durability;
     game.bombardment.defense.choosePattern = () => 'predict';
     for (let i = 0; i < 360 && game.state === 'playing'; i++) game.update(REPLAY_STEP);
-    assert.equal(game.bombardment.completed, 1);
+    assert.equal(game.bombardment.completed, 0);
     assert.ok(events.some(e => e.type === 'flak-fire'));
     assert.equal(game.state, 'ended');
     assert.equal(events.find(e => e.type === 'end').reason, 'flak');
   }
 });
 
-test('an independent volley that destroys the first battery before firing cancels its warning', () => {
+test('an independent volley that finishes a damaged battery before firing cancels its warning', () => {
   for (const seed of [17, 42]) {
     const { game, events } = sortie(seed);
+    game.bombardment.requests[0].damage = 60; // A previous pass left 100 HP; test warning cancellation.
     game.bombardment.defense.choosePattern = () => 'predict';
     for (let i = 0; i < 360 && game.state === 'playing'; i++) game.update(REPLAY_STEP);
     assert.equal(game.bombardment.completed, 1); assert.equal(game.state, 'playing');
     assert.ok(events.some(e => e.type === 'radar-lock'));
     assert.ok(!events.some(e => e.type === 'flak-fire'));
+  }
+});
+
+test('one damage upgrade makes the same first flyover destroy the tougher battery', () => {
+  for (const seed of [11, 17, 42, 77]) {
+    const { game } = sortie(seed);
+    game.state = 'upgrade'; game.choices = [UPGRADES.find(u => u.id === 'bombing')];
+    assert.equal(game.chooseUpgrade(0), true);
+    for (let i = 0; i < 360 && game.state === 'playing'; i++) game.update(REPLAY_STEP);
+    assert.equal(game.state, 'playing'); assert.equal(game.bombardment.completed, 1);
   }
 });

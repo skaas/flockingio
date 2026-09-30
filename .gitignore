@@ -4,3 +4,6 @@ node_modules/
 dist/
 .gstack/
 .playwright-mcp/
+.env.local
+.env
+.colyseus-cloud.json

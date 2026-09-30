@@ -1,8 +1,12 @@
 import { AirDefense } from './air-defense.mjs';
 
-import { FIRE_SUPPORT, DRONE_ATTACK, WORLD_RADIUS } from './rules.mjs';
+import { FIRE_SUPPORT, DRONE_ATTACK, WORLD_RADIUS, sortiePhase } from './rules.mjs';
 export { FIRE_SUPPORT, DRONE_ATTACK };
-export const droneAttack = level => DRONE_ATTACK.base + DRONE_ATTACK.perLevel * Math.max(0, Math.min(DRONE_ATTACK.maxLevel, Math.floor(level || 0)));
+const pickLevel = (level, max) => Math.max(0, Math.min(max, Math.floor(level || 0)));
+export const droneAttack = level => DRONE_ATTACK.base + DRONE_ATTACK.perLevel * pickLevel(level, DRONE_ATTACK.maxLevel);
+// A salvo pick adds a full-damage bomb per release; a reload pick halves the cooldown.
+export const droneBombCount = level => 1 + pickLevel(level, DRONE_ATTACK.salvoMaxLevel);
+export const droneAttackInterval = level => DRONE_ATTACK.interval / 2 ** pickLevel(level, DRONE_ATTACK.reloadMaxLevel);
 export const facilityDamage = request => request.damage;
 export const facilityDurability = request => request.durability;
 export const TARGET_NAMES = ['대공 포대', '대공 레이더 기지', '방공 지휘소'];
@@ -34,10 +38,13 @@ export class Bombardment {
       const point = { x: p.x + Math.cos(angle) * radius, y: p.y + Math.sin(angle) * radius };
       if (Math.hypot(point.x, point.y) > 1160 || this.requests.some(r => distance(r, point) < 340) || this.craters.some(r => distance(r, point) < 180)) continue;
       const id = this.nextId++;
+      // Challenge sites snapshot the current phase row and never change afterwards;
+      // classic keeps its id-based durability schedule and phase reward.
+      const row = game.challenge ? sortiePhase(game.phase) : null;
       const request = { ...point, id, kind: (id - 1) % 3,
         state: 'requested', hits: 0, shots: 0, damage: 0,
-        durability: Math.min(FIRE_SUPPORT.maxDurability, FIRE_SUPPORT.durability + Math.floor((id - 1) / FIRE_SUPPORT.durabilityEvery) * FIRE_SUPPORT.durabilityStep),
-        reward: 18 + game.phase * 6, completedAt: null, responded: false, responseTimer: 0 };
+        durability: row ? row.durability : Math.min(FIRE_SUPPORT.maxDurability, FIRE_SUPPORT.durability + Math.floor((id - 1) / FIRE_SUPPORT.durabilityEvery) * FIRE_SUPPORT.durabilityStep),
+        reward: row ? row.reward : 18 + game.phase * 6, completedAt: null, responded: false, responseTimer: 0 };
       this.requests.push(request);
       if (!first) game.onEvent({ type: 'strike-request', request });
       return true;
@@ -77,18 +84,23 @@ export class Bombardment {
       {
         let committedDamage = request.damage + this.bombs.reduce((sum, bomb) =>
           sum + (bomb.requestId === request.id ? bomb.damage : 0), 0);
+        // New releases use current picks; airborne bombs and running cooldowns keep theirs.
+        const damage = droneAttack(game.stats.bombing), count = droneBombCount(game.stats.salvo);
+        const interval = droneAttackInterval(game.stats.reload);
         for (const source of support) {
           if (committedDamage >= facilityDurability(request)) break;
           if (source.bombReadyAt > game.elapsed + 1e-9) continue;
-          const damage = droneAttack(game.stats.bombing);
-          const angle = game.rand(0, TAU), radius = game.rand(4, 34);
-          this.bombs.push({ requestId: request.id, x: source.x, y: source.y,
-            tx: request.x + Math.cos(angle) * radius, ty: request.y + Math.sin(angle) * radius,
-            age: 0, duration: game.rand(.45, .72), damage });
+          // A salvo shares one origin and cooldown; each bomb aims and falls on its own.
+          for (let i = 0; i < count && committedDamage < facilityDurability(request); i++) {
+            const angle = game.rand(0, TAU), radius = game.rand(4, 34);
+            this.bombs.push({ requestId: request.id, x: source.x, y: source.y,
+              tx: request.x + Math.cos(angle) * radius, ty: request.y + Math.sin(angle) * radius,
+              age: 0, duration: game.rand(.45, .72), damage });
+            request.shots++; committedDamage += damage;
+            game.onEvent({ type: 'bomb-launch', x: source.x, y: source.y });
+          }
           // The deadline travels with the drone through reentry, transfers and targets.
-          source.bombReadyAt = game.elapsed + DRONE_ATTACK.interval;
-          request.shots++; committedDamage += damage;
-          game.onEvent({ type: 'bomb-launch', x: source.x, y: source.y });
+          source.bombReadyAt = game.elapsed + interval;
         }
       }
       // The last friendly follower leaving pauses releases, not accumulated

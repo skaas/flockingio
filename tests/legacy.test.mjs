@@ -69,3 +69,51 @@ test('a replay verifies its contribution and rejects tampered combat totals', ()
   const playback = new ReplayPlayer(tape), replayGame = new Game({random:seededRandom(seed)}); replayGame.startChallenge();
   assert.throws(() => {while (!playback.step(replayGame)) {}}, /전쟁 기여도 기록/);
 });
+
+const summary = data => ({ sorties: data.sorties, fallen: data.fallen, total: data.total, best: data.best });
+
+test('time-limit sorties and deaths are both recorded, but only deaths count as fallen', () => {
+  const storage = new MemoryStorage(), memorial = new Memorial(storage, 'pilot');
+  assert.equal(memorial.record(fallen({runId:'flight-1', outcome:'completed', score:3000, completed:3, kills:0, elapsed:300})), true);
+  assert.equal(memorial.record(fallen({runId:'flight-2', outcome:'fallen'})), true);
+  assert.equal(memorial.record(fallen({runId:'flight-3', score:0, completed:0, kills:0})), true, 'a missing outcome is a death');
+  assert.equal(memorial.record(fallen({runId:'flight-1', outcome:'completed', score:9000})), false, 'a sortie is recorded once');
+  const expected = {sorties:3, fallen:2, total:4200, best:3000};
+  assert.deepEqual(summary(memorial.data), expected);
+  assert.deepEqual(memorial.data.entries.map(entry => [entry.runId, entry.outcome]), [['flight-3', 'fallen'], ['flight-2', 'fallen'], ['flight-1', 'completed']]);
+  const reloaded = new Memorial(storage, 'pilot');
+  assert.deepEqual(summary(reloaded.data), expected);
+  assert.deepEqual(reloaded.data.entries, memorial.data.entries);
+});
+
+test('older death-only memorials keep their totals and gain a sortie count', () => {
+  const storage = new MemoryStorage();
+  storage.setItem('fallen-heroes-memorial-v1:pilot', JSON.stringify({fallen:2, total:1400, best:1200,
+    entries:[fallen({runId:'old-2', score:200, completed:0}), fallen({runId:'old-1'})]}));
+  const memorial = new Memorial(storage, 'pilot');
+  assert.deepEqual(summary(memorial.data), {sorties:2, fallen:2, total:1400, best:1200});
+  assert.deepEqual(memorial.data.entries.map(entry => entry.outcome), ['fallen', 'fallen']);
+  assert.equal(memorial.record(fallen({runId:'new-1', outcome:'completed', score:2000, completed:2, kills:0})), true);
+  assert.deepEqual(summary(memorial.data), {sorties:3, fallen:2, total:3400, best:2000});
+  assert.deepEqual(memorial.data.entries.map(entry => entry.runId), ['new-1', 'old-2', 'old-1']);
+  assert.equal(JSON.parse(storage.getItem('fallen-heroes-memorial-v1:pilot')).sorties, 3);
+});
+
+test('memorial rejects an explicit invalid outcome, live or stored', () => {
+  const storage = new MemoryStorage(), memorial = new Memorial(storage, 'pilot');
+  for (const outcome of ['won', 'survived', null, 1]) assert.equal(memorial.record(fallen({outcome})), false);
+  assert.deepEqual(summary(memorial.data), {sorties:0, fallen:0, total:0, best:0});
+  assert.equal(storage.getItem(memorial.key), null);
+  storage.setItem(memorial.key, JSON.stringify({sorties:2, fallen:1, total:2400, best:1200,
+    entries:[fallen({runId:'flight-2', outcome:'victory'}), fallen()]}));
+  assert.deepEqual(new Memorial(storage, 'pilot').data.entries.map(entry => entry.runId), ['flight-1']);
+});
+
+test('memorial keeps the latest 50 sorties while totals include every sortie', () => {
+  const memorial = new Memorial(new MemoryStorage(), 'pilot');
+  for (let i = 0; i < 55; i++) memorial.record(fallen({runId:`flight-${i}`, outcome:i % 2 ? 'completed' : 'fallen', score:i}));
+  assert.deepEqual(summary(memorial.data), {sorties:55, fallen:28, total:1485, best:54});
+  assert.equal(memorial.data.entries.length, 50);
+  assert.equal(memorial.data.entries[0].runId, 'flight-54');
+  assert.equal(memorial.data.entries.at(-1).runId, 'flight-5');
+});

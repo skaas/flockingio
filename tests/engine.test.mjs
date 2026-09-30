@@ -32,9 +32,9 @@ test('an enemy head hitting the player tail drops food and awards one kill', () 
   game.resolveCollisions(); assert.equal(game.kills, 1);
   game.player.x = enemy.x; game.player.y = enemy.y;
   for (let i = 0; i < 120 && game.state === 'playing'; i++) game.collectFood(1 / 60);
-  assert.ok(game.xp >= 16 && game.xp < 48, 'absorbing a small enemy earns energy but no longer pays the full evolution cost');
-  assert.equal(game.level, 1); assert.equal(game.canEvolve(), false);
-  assert.equal(game.levelUp(), false); assert.equal(game.state, 'playing');
+  assert.ok(game.xp >= 16 && game.xp < 48, 'absorbing actual remains supplies the cheap first choice');
+  assert.equal(game.level, 1); assert.equal(game.canEvolve(), true);
+  assert.equal(game.levelUp(), true); assert.equal(game.state, 'upgrade');
 });
 
 test('the arena starts empty and surviving alone never generates food or experience', () => {
@@ -57,8 +57,8 @@ test('rival-on-rival deaths leave loot, but only collecting it grants experience
   game.entities = [game.player]; game.player.x = 500; game.player.y = 500;
   for (let i = 0; i < 120 && game.state === 'playing'; i++) game.collectFood(1 / 60);
   assert.ok(game.xp >= 16 && game.xp < 48);
-  assert.equal(game.canEvolve(), false); assert.equal(game.levelUp(), false);
-  assert.equal(game.level, 1); assert.equal(game.kills, 0);
+  assert.equal(game.canEvolve(), true); assert.equal(game.levelUp(), true);
+  assert.equal(game.level, 2); assert.equal(game.kills, 0);
 });
 
 test('a bird has no assigned slot: reordering the flock does not change its motion', () => {
@@ -204,7 +204,7 @@ test('choice is applied once, invalid input does not resume the game', () => {
 });
 test('maxed upgrades are excluded and full mastery cannot softlock', () => {
   const { game } = makeGame(); game.level = 5; for (const u of UPGRADES) game.stats[u.id] = u.max;
-  game.stats.cohesion = 4; game.xp = game.nextXp; game.levelUp();
+  game.stats.cohesion = 0; game.xp = game.nextXp; game.levelUp();
   assert.deepEqual(game.choices.map(u => u.id), ['cohesion']); game.chooseUpgrade(0);
   game.xp = game.nextXp; game.levelUp(); assert.equal(game.state, 'playing'); assert.equal(game.energy, 100);
 });

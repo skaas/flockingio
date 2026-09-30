@@ -1,0 +1,186 @@
+{
+  "preset": "approved multi-pilot-v3, voice -3dB",
+  "generation": "Google Gemini 3.8 Flash TTS",
+  "clips": [
+    {
+      "id": "collector-intercept",
+      "voice": "Enceladus",
+      "text": "회수 편대, 진로 차단한다.",
+      "file": "collector-intercept-radio-v3.wav",
+      "band_hz": [
+        700,
+        1850
+      ],
+      "seconds": 2.78,
+      "peak": 0.72,
+      "rms": 0.161,
+      "production_file": "collector-intercept.ogg",
+      "sha256": "fa8ba04f49594c099c8cba014ce38e0f8b33f9a99947ca4a644cc4ca3f969289"
+    },
+    {
+      "id": "collector-recover",
+      "voice": "Enceladus",
+      "text": "회수 편대, 잔해 확보한다.",
+      "file": "collector-recover-radio-v3.wav",
+      "band_hz": [
+        700,
+        1850
+      ],
+      "seconds": 2.5,
+      "peak": 0.689,
+      "rms": 0.178,
+      "production_file": "collector-recover.ogg",
+      "sha256": "1463e034edbfe2c22cdc7bbccef0be2b9a2b87f0cb10a86242e0e9af144b32ce"
+    },
+    {
+      "id": "collector-regroup",
+      "voice": "Enceladus",
+      "text": "회수 편대, 편대 재집결.",
+      "file": "collector-regroup-radio-v3.wav",
+      "band_hz": [
+        700,
+        1850
+      ],
+      "seconds": 2.38,
+      "peak": 0.725,
+      "rms": 0.187,
+      "production_file": "collector-regroup.ogg",
+      "sha256": "3678284be96382cc4719e2e744c9bd8d4f046ca805105288bec9f72cf6d6787c"
+    },
+    {
+      "id": "collector-evade",
+      "voice": "Enceladus",
+      "text": "회수 편대, 위험하다. 회피 기동!",
+      "file": "collector-evade-radio-v3.wav",
+      "band_hz": [
+        700,
+        1850
+      ],
+      "seconds": 3.18,
+      "peak": 0.728,
+      "rms": 0.176,
+      "production_file": "collector-evade.ogg",
+      "sha256": "77a0949b88cb7f91cce4f9d8bfa5ef00c7a7ced0aa6d023e2c8a3ee8c238a460"
+    },
+    {
+      "id": "pursuer-intercept",
+      "voice": "Orus",
+      "text": "요격 편대, 진로 차단한다.",
+      "file": "pursuer-intercept-radio-v3.wav",
+      "band_hz": [
+        650,
+        1950
+      ],
+      "seconds": 2.795,
+      "peak": 0.716,
+      "rms": 0.18,
+      "production_file": "pursuer-intercept.ogg",
+      "sha256": "bb762ed5cfa75b477a139360454994e6fa0c6a2fa56bda56b70ad87cd7d98973"
+    },
+    {
+      "id": "pursuer-recover",
+      "voice": "Orus",
+      "text": "요격 편대, 잔해 확보한다.",
+      "file": "pursuer-recover-radio-v3.wav",
+      "band_hz": [
+        650,
+        1950
+      ],
+      "seconds": 2.795,
+      "peak": 0.684,
+      "rms": 0.172,
+      "production_file": "pursuer-recover.ogg",
+      "sha256": "cfe8c674211bd5ada1ec8ec2b091b0b3a6afd69f01be33bfb5db102ba8b8c6fd"
+    },
+    {
+      "id": "pursuer-regroup",
+      "voice": "Orus",
+      "text": "요격 편대, 편대 재집결.",
+      "file": "pursuer-regroup-radio-v3.wav",
+      "band_hz": [
+        650,
+        1950
+      ],
+      "seconds": 2.795,
+      "peak": 0.71,
+      "rms": 0.179,
+      "production_file": "pursuer-regroup.ogg",
+      "sha256": "c832af2160c7ea6e6087050a0191a9f595260031c38f4c44a60af82ca19b783a"
+    },
+    {
+      "id": "pursuer-evade",
+      "voice": "Orus",
+      "text": "요격 편대, 위험하다. 회피 기동!",
+      "file": "pursuer-evade-radio-v3.wav",
+      "band_hz": [
+        650,
+        1950
+      ],
+      "seconds": 2.955,
+      "peak": 0.697,
+      "rms": 0.179,
+      "production_file": "pursuer-evade.ogg",
+      "sha256": "c480f7a29a2d3710c3bf9c560d6ba28eccda3a2f0092f601f3b6c2e4e524b759"
+    },
+    {
+      "id": "keeper-intercept",
+      "voice": "Algenib",
+      "text": "호위 편대, 진로 차단한다.",
+      "file": "keeper-intercept-radio-v3.wav",
+      "band_hz": [
+        760,
+        1800
+      ],
+      "seconds": 2.61,
+      "peak": 0.69,
+      "rms": 0.176,
+      "production_file": "keeper-intercept.ogg",
+      "sha256": "eac42fee6adde9cb75702c38995fde897212f3a306b3601ac89453ee72cf58b4"
+    },
+    {
+      "id": "keeper-recover",
+      "voice": "Algenib",
+      "text": "호위 편대, 잔해 확보한다.",
+      "file": "keeper-recover-radio-v3.wav",
+      "band_hz": [
+        760,
+        1800
+      ],
+      "seconds": 2.65,
+      "peak": 0.693,
+      "rms": 0.174,
+      "production_file": "keeper-recover.ogg",
+      "sha256": "d097dffc02d74f55a556e248aedd50d00ac75f5b1263aa44c50d1eab6f93447b"
+    },
+    {
+      "id": "keeper-regroup",
+      "voice": "Algenib",
+      "text": "호위 편대, 편대 재집결.",
+      "file": "keeper-regroup-radio-v3.wav",
+      "band_hz": [
+        760,
+        1800
+      ],
+      "seconds": 2.45,
+      "peak": 0.726,
+      "rms": 0.176,
+      "production_file": "keeper-regroup.ogg",
+      "sha256": "99e4f98938a9aa7cc14858baf6e4c54dad5e9ba99291ed3eb1691a7a82db7b04"
+    },
+    {
+      "id": "keeper-evade",
+      "voice": "Algenib",
+      "text": "호위 편대, 위험하다. 회피 기동!",
+      "file": "keeper-evade-radio-v3.wav",
+      "band_hz": [
+        760,
+        1800
+      ],
+      "seconds": 2.69,
+      "peak": 0.701,
+      "rms": 0.165,
+      "production_file": "keeper-evade.ogg",
+      "sha256": "ca710117789a35406990c7c4e48d7b374c7906f272b2e92ecc69f8a7b438a455"
+    }
+  ]
+}

@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Game } from '../src/engine.mjs';
+import { Game, CHALLENGE_PHASES } from '../src/engine.mjs';
 import { AIR_DEFENSE, FLAK_PATTERNS } from '../src/air-defense.mjs';
 import { seededRandom, REPLAY_STEP, replayFingerprint } from '../src/replay.mjs';
 
-function setup(pattern = 'predict') {
+// The final phase has every solution and the shortest (1 s) warning; phase-specific
+// timing and pattern availability are covered in five-minute.test.mjs.
+function setup(pattern = 'predict', phase = CHALLENGE_PHASES.length - 1) {
   const game = new Game(), events = [];
   game.random = seededRandom(11); game.startChallenge(); game.onEvent = e => events.push(e);
+  game.elapsed = CHALLENGE_PHASES[phase]; game.phase = phase;
   const site = game.bombardment.requests[0]; site.x = 0; site.y = 0;
   game.bombardment.requests = [site]; game.player.boids = []; game.entities = [game.player];
   Object.assign(game.player, { x: 80, y: 0, vx: 0, vy: 0, invincible: 0 });
@@ -35,7 +38,7 @@ test('leaving range freezes and releases tracking and cancels an un-fired lock',
   const { game, defense } = setup(); lock(game);
   const aim = [defense.aimX, defense.aimY]; game.player.x = AIR_DEFENSE.releaseRange + 1;
   step(game, REPLAY_STEP); assert.equal(defense.state, 'lost');
-  step(game, AIR_DEFENSE.warningSeconds + 1);
+  step(game, defense.warning + 1);
   assert.equal(defense.state, 'idle'); assert.equal(defense.shells.length, 0);
   assert.deepEqual([defense.aimX, defense.aimY], aim);
   game.player.x = 80; step(game, REPLAY_STEP); assert.equal(defense.state, 'tracking'); assert.ok(defense.progress < .02);
@@ -56,7 +59,7 @@ test('overlapping sites do not switch a pursuing aim point or stack simultaneous
   const { game, defense, site } = setup(); step(game, .2);
   game.bombardment.requests.push({ ...site, id: 100, x: 90 });
   step(game, .2); assert.equal(defense.sourceId, site.id);
-  lock(game); game.player.y = 100; step(game, AIR_DEFENSE.warningSeconds + REPLAY_STEP);
+  lock(game); game.player.y = 100; step(game, defense.warning + REPLAY_STEP);
   assert.equal(defense.shells.length, 1);
 });
 
@@ -84,7 +87,7 @@ test('three predicted destinations commit before a full warning and fire at a fi
   lock(game);
   const plan = structuredClone(defense.salvo);
   assert.equal(plan.length, 3);
-  assert.equal(plan[0].tx, -180 + 112 * (AIR_DEFENSE.warningSeconds + AIR_DEFENSE.flightSeconds));
+  assert.equal(plan[0].tx, -180 + 112 * (defense.warning + AIR_DEFENSE.flightSeconds));
   assert.equal(plan[0].ty, 0);
   assert.ok(plan[1].tx > plan[0].tx && plan[2].tx > plan[1].tx);
   assert.ok(plan[1].ty > 0 && plan[2].ty < 0);
@@ -101,13 +104,13 @@ test('three predicted destinations commit before a full warning and fire at a fi
     assert.deepEqual(defense.salvo, plan);
   }
   assert.deepEqual(fired, plan);
-  assert.equal(fireTicks[0], Math.round(AIR_DEFENSE.warningSeconds / REPLAY_STEP));
+  assert.equal(fireTicks[0], Math.round(defense.warning / REPLAY_STEP));
   for (let i = 1; i < fireTicks.length; i++) assert.ok(Math.abs((fireTicks[i] - fireTicks[i - 1]) * REPLAY_STEP - AIR_DEFENSE.salvoInterval) <= REPLAY_STEP);
   assert.equal(events.filter(e => e.type === 'flak-impact').length, 3);
   assert.equal(events.filter(e => e.type === 'flak-fire').length, 3);
   assert.ok(events.filter(e => e.type === 'flak-fire').every(e => e.x === site.x && e.y === site.y));
   assert.equal(defense.state, 'cooldown');
-  step(game, AIR_DEFENSE.reloadSeconds);
+  step(game, defense.reload + REPLAY_STEP);
   assert.equal(defense.state, 'tracking'); assert.equal(defense.salvo.length, 0);
 });
 
@@ -130,7 +133,7 @@ test('the first predictive shell causes damage only on arrival and respects spaw
   for (const protectedFlight of [false, true]) {
     const { game, defense, events } = setup(); lock(game);
     game.player.invincible = protectedFlight ? 10 : 0;
-    step(game, AIR_DEFENSE.warningSeconds);
+    step(game, defense.warning);
     assert.equal(defense.shotIndex, 1); assert.equal(game.state, 'playing');
     step(game, AIR_DEFENSE.flightSeconds - REPLAY_STEP);
     assert.equal(game.state, 'playing');
@@ -143,7 +146,7 @@ test('the first predictive shell causes damage only on arrival and respects spaw
 test('destroying or leaving a battery cancels pending shots but airborne shells still land', () => {
   for (const reason of ['destroyed', 'out of range']) for (const afterFire of [false, true]) {
     const { game, defense, site, events } = setup(); lock(game);
-    if (afterFire) step(game, AIR_DEFENSE.warningSeconds);
+    if (afterFire) step(game, defense.warning);
     if (reason === 'destroyed') site.state = 'complete';
     else game.player.x = AIR_DEFENSE.releaseRange + 1;
     step(game, REPLAY_STEP);
@@ -159,7 +162,7 @@ test('destroying or leaving a battery cancels pending shots but airborne shells 
 
 test('pause freezes a pending salvo and airborne shells, and fingerprints include future shots', () => {
   const { game, defense } = setup(); lock(game);
-  step(game, AIR_DEFENSE.warningSeconds);
+  step(game, defense.warning);
   assert.equal(defense.state, 'salvo'); assert.equal(defense.shells.length, 1);
   const digest = replayFingerprint(game);
   defense.salvo[2].tx += 1; assert.notEqual(replayFingerprint(game), digest);
@@ -172,7 +175,7 @@ test('pause freezes a pending salvo and airborne shells, and fingerprints includ
 });
 
 test('practice and a new sortie start without a pending salvo or leftover projectiles', () => {
-  const { game, defense } = setup(); lock(game); step(game, AIR_DEFENSE.warningSeconds);
+  const { game, defense } = setup(); lock(game); step(game, defense.warning);
   game.startPractice(); step(game, 10);
   assert.equal(game.bombardment.defense.state, 'idle');
   assert.equal(game.bombardment.defense.salvo.length, 0);
@@ -180,9 +183,9 @@ test('practice and a new sortie start without a pending salvo or leftover projec
   assert.equal(game.bombardment.defense.shells.length, 0);
 });
 
-test('batteries pick one of four firing solutions from the engagement, never repeating the last', () => {
+test('final-phase batteries pick one of four firing solutions from the engagement, never repeating the last', () => {
   const draws = () => {
-    const game = new Game(); game.random = seededRandom(5); game.startChallenge();
+    const game = new Game(); game.random = seededRandom(5); game.startChallenge(); game.phase = CHALLENGE_PHASES.length - 1;
     const defense = game.bombardment.defense, before = game.random.state(), picked = [];
     for (let i = 0; i < 80; i++) {
       Object.assign(game.player, { x: (i * 37) % 300 - 150, y: (i * 53) % 240 - 120 });
@@ -247,7 +250,7 @@ test('the radial solution fires one gap-free ring at the commander range and pun
   for (const shot of plan) assert.ok(Math.abs(Math.hypot(shot.tx - site.x, shot.ty - site.y) - range) < 1e-6);
   const gap = Math.hypot(plan[1].tx - plan[0].tx, plan[1].ty - plan[0].ty);
   assert.ok(gap < 2 * AIR_DEFENSE.blastRadius + 2 * p.radius, 'no gap wide enough to slip through');
-  step(game, AIR_DEFENSE.warningSeconds);
+  step(game, defense.warning);
   assert.equal(defense.shells.length, plan.length, 'every radial shell leaves on the same step');
   assert.equal(events.filter(e => e.type === 'flak-fire').length, plan.length);
   // Circling at a fixed range meets the ring; leaving the circle, straight or outward, does not.

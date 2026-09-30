@@ -1,0 +1,19 @@
+{
+  "file": "control-strike-request.ogg",
+  "sha256": "12e0c6c876999d6b1b8167c9dcea09a250eb3a08264a5001770f85dc6148f57f",
+  "source": "Google Gemini 3.8 Flash TTS",
+  "processing": "approved heavy radio v3; speech -3dB",
+  "exchange": [
+    {
+      "voice": "Orus",
+      "text": "팔콘 원, 목표 좌표 전송. 타격 요청한다."
+    },
+    {
+      "voice": "Enceladus",
+      "text": "팔콘 원, 수신. 목표로 접근한다."
+    }
+  ],
+  "audition": "Technical validation only; pronunciation and acting not independently heard.",
+  "reference": "https://www.faa.gov/air_traffic/publications/aim_html/chap4_section_2.html",
+  "reference_note": "Original fictional Korean dialogue inspired by concise callsign/message/acknowledgement structure; not a literal military procedure."
+}

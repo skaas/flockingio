@@ -18,9 +18,9 @@ function settle(game, input = {}) {
   return game.player.speed;
 }
 
-test('visible growth progressively increases cruising speed up to double, independently of level bookkeeping', () => {
-  const speeds = [1, 2, 3, 4].map(scale => settle(scene(scale)));
-  assert.equal(speeds[0], 112); assert.equal(speeds[3], 224);
+test('visible growth progressively increases cruising speed up to the 1.6-size cap, independently of level bookkeeping', () => {
+  const speeds = [1, 1.2, 1.4, 1.6].map(scale => settle(scene(scale)));
+  assert.equal(speeds[0], 112); assert.ok(Math.abs(speeds[3] - 112 * Math.sqrt(1.6)) < 1e-9);
   assert.ok(speeds.every((v, i) => i === 0 || v > speeds[i - 1]));
   const game = scene(); game.level = 31;
   assert.equal(settle(game), 112, 'queued growth must not instantly change speed before the body grows');
@@ -30,16 +30,16 @@ test('visible growth progressively increases cruising speed up to double, indepe
 
 test('movement upgrades, boost and gather still work on top of the large leader speed', () => {
   for (const input of [{}, { boost: true }, { gather: true }]) {
-    const small = scene(), large = scene(4);
-    small.stats.alignment = large.stats.alignment = 5;
-    assert.ok(Math.abs(settle(large, input) / settle(small, input) - 2) < 1e-9);
+    const small = scene(), large = scene(1.6);
+    small.stats.alignment = large.stats.alignment = 1;
+    assert.ok(Math.abs(settle(large, input) / settle(small, input) - Math.sqrt(1.6)) < 1e-9);
   }
-  const upgraded = scene(4); upgraded.stats.alignment = 5;
-  assert.ok(settle(upgraded) > settle(scene(4)));
+  const upgraded = scene(1.6); upgraded.stats.alignment = 1;
+  assert.ok(settle(upgraded) > settle(scene(1.6)));
 });
 
 test('the larger leader accelerates and brakes smoothly without bypassing the turn limits', () => {
-  const game = scene(4), p = game.player;
+  const game = scene(1.6), p = game.player;
   for (let i = 0; i < 300; i++) {
     const speed = p.speed, turnRate = p.turnRate;
     game.steerPlayer(1 / 60, { dy: i < 150 ? 1 : -1, boost: i < 180, gather: i >= 180 });
@@ -52,7 +52,7 @@ test('the larger leader accelerates and brakes smoothly without bypassing the tu
 
 test('a large leader inside its own flock emerges ahead in four seconds without abandoning followers', () => {
   for (const count of [8, 16]) for (const seed of [7, 42, 123]) {
-    const game = scene(4, seed), p = game.player;
+    const game = scene(1.6, seed), p = game.player;
     while (p.boids.length < count) game.addBoid(p);
     // Put the existing, irregular flock around and ahead of the head, preserving
     // individual velocities. Escape must use ordinary flight and local following.
@@ -60,7 +60,7 @@ test('a large leader inside its own flock emerges ahead in four seconds without 
     for (const b of [p, ...p.boids]) { b.x -= 650; b.px = b.x; }
     assert.ok(p.boids.filter(b => b.x > p.x).length > count / 3);
     for (let i = 0; i < 240; i++) game.update(1 / 60, { dx: 1 });
-    assert.equal(game.state, 'playing'); assert.equal(p.speed, 224);
+    assert.equal(game.state, 'playing'); assert.ok(Math.abs(p.speed - 112 * Math.sqrt(1.6)) < 1e-9);
     assert.equal(p.boids.length, count); assert.equal(game.strays.length, 0);
     assert.ok(p.boids.every(b => p.x - b.x > p.radius), `head stayed inside ${count} birds with seed ${seed}`);
   }
@@ -68,8 +68,8 @@ test('a large leader inside its own flock emerges ahead in four seconds without 
 
 test('maximum growth and speed upgrades still turn inside the arena without position clamps', () => {
   for (const boost of [false, true]) {
-    const game = scene(4), p = game.player; p.boids = [];
-    game.stats.alignment = game.stats.boost = 5;
+    const game = scene(1.6), p = game.player; p.boids = [];
+    game.stats.alignment = game.stats.boost = 1;
     p.x = p.px = WORLD_RADIUS - 650;
     const cruise = game.cruiseSpeed(p);
     for (let i = 0; i < 600; i++) {

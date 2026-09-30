@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { FLEET } from '../src/rules.mjs';
-import { Game, FLIGHT, MAX_FLOCK, angleDelta } from '../src/engine.mjs';
+import { Game, FLIGHT, ENEMY_FLIGHT, MAX_FLOCK, angleDelta } from '../src/engine.mjs';
 
 function setup() {
   let seed = 321;
@@ -65,19 +65,27 @@ test('passing in the opposite direction does not recruit, and a passing same-dir
   assert.equal(bird.influence, 0); assert.equal(bird.owner, large.id);
 });
 
-test('enemy and player flight have identical momentum, energy and turn limits at equal stats', () => {
+test('enemy flight keeps finite momentum and shared turn limits with a slower boost than the player', () => {
   const game = setup(), p = game.player, e = game.makeFlock(0, 0, 0, 0);
   place(p, 0, 0, 112); place(e, 0, 0, 112); e.speed = p.speed = e.cruiseSpeed = 112;
+  let playerPeak = 0, enemyPeak = 0;
   for (let i = 0; i < 600; i++) {
     const heading = i % 180 < 90 ? Math.PI / 2 : -Math.PI / 2;
     const boost = i % 240 < 140, gather = i % 240 > 200;
     game.steerPlayer(1 / 60, { dx: Math.cos(heading), dy: Math.sin(heading), boost, gather });
-    e.control = { heading, boost, gather }; const previousRate = e.turnRate;
+    e.control = { heading, boost, gather };
+    const previousRate = e.turnRate, previousSpeed = e.speed, previousEnergy = e.energy;
     game.steerEnemy(e, 1 / 60);
-    assert.ok(Math.abs(e.angle - p.angle) < 1e-9); assert.equal(e.speed, p.speed);
-    assert.equal(e.energy, game.energy); assert.equal(e.boosting, p.boosting);
+    assert.ok(e.speed - previousSpeed <= ENEMY_FLIGHT.thrust / 60 + 1e-9);
+    assert.ok(previousSpeed - e.speed <= FLIGHT.braking / 60 + 1e-9);
+    assert.ok(e.speed <= e.cruiseSpeed * ENEMY_FLIGHT.boostMultiplier + 1e-9);
     assert.ok(Math.abs(e.turnRate - previousRate) <= FLIGHT.turnAcceleration / 60 + 1e-9);
+    assert.ok(Math.abs(e.turnRate) <= FLIGHT.turnRate * Math.min(1, e.cruiseSpeed / e.speed) + 1e-9);
+    assert.ok(Math.abs(e.energy - Math.max(0, Math.min(100, previousEnergy + (e.boosting ? -31 : 18) / 60))) < 1e-9);
+    if (gather) assert.equal(e.boosting, false);
+    playerPeak = Math.max(playerPeak, p.speed); enemyPeak = Math.max(enemyPeak, e.speed);
   }
+  assert.ok(playerPeak > enemyPeak * 1.5);
 });
 
 test('enemy boost opens the turning radius and reversing input cannot erase an existing bank', () => {

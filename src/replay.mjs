@@ -1,5 +1,8 @@
 import { battleContribution } from './legacy.mjs';
 import { RULES_VERSION, SIMULATION_STEP, FLEET } from './rules.mjs';
+import { seededRandom } from './simulation-rng.mjs';
+import { fleetFingerprint } from './fleet-state.mjs';
+export { seededRandom };
 
 // A replay is a seed, the inputs applied at each fixed simulation step, and
 // the player's discrete decisions. Visual effects and wall-clock time are not
@@ -9,17 +12,8 @@ export const REPLAY_STEP = SIMULATION_STEP;
 const CHECK_INTERVAL = 300;
 const STORE = 'runs', KEY = 'latest';
 
-export function seededRandom(seed) {
-  let state = seed >>> 0;
-  const random = () => {
-    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-    return state / 4294967296;
-  };
-  random.state = () => state;
-  return random;
-}
-
 export function replayFingerprint(game) {
+  if (game.practice === 'fleet-battle') return fleetFingerprint(game);
   let hash = 2166136261;
   const add = value => { hash = Math.imul(hash ^ (Number.isFinite(value) ? Math.round(value * 1000) | 0 : 0), 16777619) >>> 0; };
   for (const value of [game.elapsed, game.level, game.xp, game.nextXp, game.energy, game.kills,
@@ -50,6 +44,7 @@ export function replayFingerprint(game) {
     {
       add(defense.shotIndex); add(defense.salvo.length);
       add(['predict', 'left', 'right', 'radial'].indexOf(defense.pattern)); add(defense.interval); add(defense.volleys);
+      add(defense.warning); add(defense.reload);
       for (const shot of defense.salvo) { add(shot.tx); add(shot.ty); }
     }
   }
@@ -60,7 +55,7 @@ const packInput = input => [input.dx || 0, input.dy || 0,
   Number.isFinite(input.targetX) ? input.targetX : null,
   Number.isFinite(input.targetY) ? input.targetY : null,
   (input.boost ? 1 : 0) | (input.gather ? 2 : 0)];
-const unpackInput = row => ({ dx: row[1], dy: row[2], targetX: row[3], targetY: row[4],
+const unpackInput = row => ({ dx: row[1], dy: row[2], targetX: row[3] ?? undefined, targetY: row[4] ?? undefined,
   boost: Boolean(row[5] & 1), gather: Boolean(row[5] & 2) });
 
 export class ReplayRecorder {
@@ -74,29 +69,39 @@ export class ReplayRecorder {
     else this.inputs.push([1, ...values]);
     this.tick++;
   }
-  action(kind, choice = null) { this.actions.push([this.tick, kind, choice]); }
+  action(kind, choice = null) {
+    if (this.mode === 'fleet-battle') throw new Error('Fleet battles have no upgrade actions.');
+    this.actions.push([this.tick, kind, choice]);
+  }
   afterStep(game) {
+    if (this.mode === 'fleet-battle' && game.simulationTick !== this.tick) throw new Error('Fleet tick and recording diverged.');
     if (this.tick % CHECK_INTERVAL === 0 || game.state === 'ended') this.checks.push([this.tick, replayFingerprint(game)]);
   }
   finish(game) {
     if (game.state !== 'ended' || !this.tick) throw new Error('종료된 출격만 저장할 수 있습니다.');
+    if (this.mode === 'fleet-battle' && (game.simulationTick !== this.tick || game.simulationSeed !== this.seed))
+      throw new Error('Fleet recording does not cover this run.');
+    if (this.checks.at(-1)?.[0] !== this.tick) this.checks.push([this.tick, replayFingerprint(game)]);
     return { version: REPLAY_VERSION, mode: this.mode, seed: this.seed, ticks: this.tick,
       inputs: this.inputs, actions: this.actions, checks: this.checks,
-      result: { contribution: battleContribution(game), won: game.won, elapsed: game.elapsed, kills: game.kills, maxFlock: game.maxFlock,
+      result: { contribution: this.mode === 'fleet-battle' ? null : battleContribution(game), won: game.won, elapsed: game.elapsed, kills: game.kills, maxFlock: game.maxFlock,
         fingerprint: replayFingerprint(game) } };
   }
 }
 
 export function validReplay(data) {
-  if (!data || data.version !== REPLAY_VERSION || !['challenge', 'classic', 'quick'].includes(data.mode)
+  if (!data || data.version !== REPLAY_VERSION || !['challenge', 'classic', 'quick', 'fleet-battle'].includes(data.mode)
     || !Number.isInteger(data.seed) || data.seed < 0 || data.seed > 0xffffffff
     || !Number.isInteger(data.ticks) || data.ticks < 1 || data.ticks > 60 * 60 * 60 * 24
     || !Array.isArray(data.inputs) || !Array.isArray(data.actions) || !Array.isArray(data.checks)
     || !data.result || typeof data.result.won !== 'boolean' || !Number.isFinite(data.result.elapsed)
     || Math.abs(data.result.elapsed - data.ticks * REPLAY_STEP) > 1e-6
     || !Number.isInteger(data.result.kills) || data.result.kills < 0
-    || !Number.isInteger(data.result.maxFlock) || data.result.maxFlock < 0 || data.result.maxFlock > FLEET.max
+    || data.mode === 'fleet-battle' && data.result.kills > 100000
+    || !Number.isInteger(data.result.maxFlock) || data.result.maxFlock < 0
+    || data.result.maxFlock > (data.mode === 'fleet-battle' ? 100000 : FLEET.max)
     || !Number.isInteger(data.result.fingerprint) || data.result.fingerprint < 0 || data.result.fingerprint > 0xffffffff) return false;
+  if (data.mode === 'fleet-battle' && (data.actions.length !== 0 || data.result.contribution != null)) return false;
   const contribution = data.result.contribution;
   if (contribution != null && (!Number.isInteger(contribution.completed) || contribution.completed < 0 || contribution.completed > 100000
     || contribution.kills !== data.result.kills || !Number.isInteger(contribution.score) || contribution.score < 0)) return false;
@@ -105,6 +110,7 @@ export function validReplay(data) {
     if (!Array.isArray(row) || row.length !== 6 || !Number.isInteger(row[0]) || row[0] < 1
       || !row.slice(1, 3).every(n => Number.isInteger(n) && n >= -1 && n <= 1)
       || !row.slice(3, 5).every(n => n === null || Number.isFinite(n) && Math.abs(n) <= 10000)
+      || data.mode === 'fleet-battle' && (row[3] === null) !== (row[4] === null)
       || !Number.isInteger(row[5]) || row[5] < 0 || row[5] > 3) return false;
     ticks += row[0];
   }
@@ -137,6 +143,7 @@ export class ReplayPlayer {
   }
   step(game) {
     if (this.tick >= this.data.ticks) throw new Error('마지막 출격의 재생이 이미 끝났습니다.');
+    if (this.data.mode === 'fleet-battle' && this.tick === 0) game.startFleetBattle(this.data.seed);
     while (this.data.actions[this.actionIndex]?.[0] === this.tick) {
       const [, kind, choice] = this.data.actions[this.actionIndex++];
       const applied = kind === 'evolve' ? game.levelUp() : game.chooseUpgrade(choice);
@@ -144,8 +151,11 @@ export class ReplayPlayer {
     }
     if (game.state !== 'playing') throw new Error(`${this.tick}프레임에서 게임 상태가 달라졌어요.`);
     const row = this.data.inputs[this.segment];
-    game.update(REPLAY_STEP, unpackInput(row));
+    if (this.data.mode === 'fleet-battle') game.step(unpackInput(row));
+    else game.update(REPLAY_STEP, unpackInput(row));
     this.tick++; this.remaining--;
+    if (this.data.mode === 'fleet-battle' && (game.simulationTick !== this.tick || game.simulationSeed !== this.data.seed))
+      throw new Error(`${this.tick}프레임에서 편대 시계가 달라졌어요.`);
     if (!this.remaining && this.tick < this.data.ticks) this.remaining = this.data.inputs[++this.segment][0];
     if (this.data.checks[this.checkIndex]?.[0] === this.tick) {
       if (replayFingerprint(game) !== this.data.checks[this.checkIndex][1]) throw new Error(`${this.tick}프레임에서 편대 상태가 달라졌어요.`);

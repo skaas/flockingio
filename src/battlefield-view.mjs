@@ -1,21 +1,26 @@
 import { FLAK_PATTERN_LABELS } from './air-defense.mjs';
 import { FIRE_SUPPORT, requestCoordinates, facilityDamage, facilityDurability } from './bombardment.mjs';
-import { sprite, explosion } from './sprites.mjs';
+import { sprite, explosion, hvSprite } from './sprites.mjs';
+import { headingFrame } from './battlefield-map.mjs';
 const TAU = Math.PI * 2;
 // Objective = amber, friendly/cleared = cyan, hostile fire control = red.
 const amber = '#efbb77', mint = '#78dcea';
+// Warning progress uses the duration committed at lock, so a phase change cannot make it jump.
+export const warningProgress = defense => Math.max(0, Math.min(1, 1 - defense.timer / (defense.warning > 0 ? defense.warning : defense.config.warningSeconds)));
 
-function structure(ctx, kind, damaged = false, damage = 0) {
-  const name = ['bunker', 'radar', 'depot'][kind];
-  if (sprite(ctx, damaged || damage > .65 ? `${name}Ruined` : name, -42, -42, 84)) {
-    if (!damaged) {
-      sprite(ctx, 'missileTruck', -76, 0, 26, 42);
-      sprite(ctx, 'turret', 48, -35, 24, 48);
-      if (kind === 0) sprite(ctx, 'turret', -16, -34, 32, 64);
-      else sprite(ctx, 'carrier', 22, 42, 32);
-    }
-    return;
+// Hard Vacuum facilities: flak battery, radar dish and domed command post.
+const FACILITIES = [{ live: 'flak', ruin: 'flakRuin' }, { live: 'radar', ruin: 'radarRuin' }, { live: 'command', ruin: 'commandRuin' }];
+function structure(ctx, kind, damaged = false, damage = 0, frame = 0) {
+  const art = FACILITIES[kind], ruined = damaged || damage > .65;
+  const smoothing = ctx.imageSmoothingEnabled; ctx.imageSmoothingEnabled = false;
+  const drawn = hvSprite(ctx, ruined ? art.ruin : art.live, ruined ? 0 : frame, 0, -6, 2);
+  if (drawn && !damaged) {
+    // Supporting emplacements make each site read as a defended position.
+    hvSprite(ctx, 'intact', kind === 1 ? 0 : 1, kind === 2 ? -58 : 56, kind === 2 ? 14 : -22, 1);
+    hvSprite(ctx, 'light', kind + 5, kind === 2 ? 52 : -54, 24, 1.3);
   }
+  ctx.imageSmoothingEnabled = smoothing;
+  if (drawn) return;
   ctx.fillStyle = damaged ? '#1c292a' : '#40514b'; ctx.strokeStyle = damaged ? '#5d6050' : '#9b9974'; ctx.lineWidth = 1.5;
   if (kind === 0) {
     for (const x of [-25, 22]) {
@@ -42,10 +47,11 @@ export function drawGroundWar(ctx, game, camera, onScreen, reducedMotion) {
   for (const crater of war.craters) {
     if (!onScreen(crater.x, crater.y, 100)) continue;
     ctx.save(); ctx.translate(crater.x, crater.y);
-    ctx.fillStyle = '#071718'; ctx.globalAlpha = .8;
-    ctx.beginPath(); ctx.ellipse(0, 0, 56, 40, -.3, 0, TAU); ctx.fill();
-    ctx.strokeStyle = '#7b725444'; ctx.lineWidth = 5; ctx.stroke();
-    ctx.globalAlpha = .48; structure(ctx, crater.kind, true); ctx.restore();
+    // Scorched ground and the facility's wreck remain where it was suppressed.
+    const burn = ctx.createRadialGradient(0, 4, 8, 0, 4, 70);
+    burn.addColorStop(0, '#0a0806e6'); burn.addColorStop(.6, '#0a080699'); burn.addColorStop(1, '#0a080600');
+    ctx.fillStyle = burn; ctx.globalAlpha = 1; ctx.beginPath(); ctx.ellipse(0, 4, 72, 54, -.3, 0, TAU); ctx.fill();
+    ctx.globalAlpha = .9; structure(ctx, crater.kind, true); ctx.restore();
   }
   for (const r of war.requests) {
     if (!onScreen(r.x, r.y, FIRE_SUPPORT.radius + 60)) continue;
@@ -54,9 +60,12 @@ export function drawGroundWar(ctx, game, camera, onScreen, reducedMotion) {
     ctx.save(); ctx.translate(r.x, r.y);
     if (!complete) {
       // Earthworks and hard targets sit below the targeting overlay and drones.
-      ctx.fillStyle = '#253632'; ctx.globalAlpha = .75; ctx.fillRect(-61, -48, 122, 96);
-      ctx.strokeStyle = '#7f8060'; ctx.lineWidth = 6; ctx.setLineDash([16, 5]); ctx.strokeRect(-61, -48, 122, 96); ctx.setLineDash([]);
-      ctx.globalAlpha = 1; structure(ctx, r.kind, false, facilityDamage(r) / facilityDurability(r));
+      ctx.fillStyle = '#1b2724'; ctx.globalAlpha = .55; ctx.fillRect(-61, -48, 122, 96);
+      ctx.strokeStyle = '#8a8466'; ctx.lineWidth = 5; ctx.setLineDash([16, 5]); ctx.globalAlpha = .7; ctx.strokeRect(-61, -48, 122, 96); ctx.setLineDash([]);
+      ctx.globalAlpha = .45; ctx.fillStyle = '#000'; ctx.beginPath(); ctx.ellipse(-6, 22, 40, 14, 0, 0, TAU); ctx.fill();
+      const frame = r.kind === 0 ? headingFrame(Math.atan2(game.player.y - r.y, game.player.x - r.x))
+        : Math.floor(game.elapsed * (r.kind === 1 ? 9 : 6));
+      ctx.globalAlpha = 1; structure(ctx, r.kind, false, facilityDamage(r) / facilityDurability(r), frame);
     }
     if (!complete) { ctx.globalAlpha = .7; sprite(ctx, 'focus', -15, -FIRE_SUPPORT.radius + 5, 30); }
     if (!complete) {
@@ -179,7 +188,7 @@ export function drawAirDefense(ctx, game, camera, reducedMotion) {
     // Only un-fired destinations and shells still in flight are dangerous.
     // Keep their exact blast footprints visible, even after the site is destroyed.
     const targets = defense.salvo.slice(defense.shotIndex).map((shot, i) => ({ ...shot,
-      shot: defense.shotIndex + i + 1, progress: locked ? 1 - defense.timer / config.warningSeconds : 1 }));
+      shot: defense.shotIndex + i + 1, progress: locked ? warningProgress(defense) : 1 }));
     for (const shell of defense.shells) targets.push({ ...shell, progress: shell.age / config.flightSeconds, airborne: true });
     targets.sort((a, b) => a.shot - b.shot);
     // Radial shells burst together on one ring: draw the ring, not a numbered path.

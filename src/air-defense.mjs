@@ -1,11 +1,11 @@
-import { AIR_DEFENSE } from './rules.mjs';
+import { AIR_DEFENSE, FLAK_PATTERN_IDS, sortiePhase } from './rules.mjs';
 export { AIR_DEFENSE };
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const TAU = Math.PI * 2;
 // Four firing solutions, each beaten by a different manoeuvre:
 // predict (straight line) → turn; left / right (sustained turn) → fly straight or turn the
 // other way; radial (ring at the commander's range) → stop circling, break in or out.
-export const FLAK_PATTERNS = Object.freeze(['predict', 'left', 'right', 'radial']);
+export const FLAK_PATTERNS = FLAK_PATTERN_IDS;
 // What the warning says: the solution's name and the manoeuvre that beats it.
 export const FLAK_PATTERN_LABELS = Object.freeze({
   predict: { name: '직진 예측 사격', counter: '방향을 꺾으세요' },
@@ -23,17 +23,31 @@ export class AirDefense {
     this.aimX = 0; this.aimY = 0; this.timer = 0; this.progress = 0;
     this.nearest = null; this.overflight = null; this.shells = []; this.bursts = [];
     this.salvo = []; this.shotIndex = 0; this.pattern = null; this.interval = this.config.salvoInterval; this.volleys = 0;
+    // Committed at lock, so a later phase cannot shorten a warning or its reload.
+    this.warning = this.config.warningSeconds; this.reload = this.config.reloadSeconds;
   }
   loseTrack() {
     this.state = 'lost'; this.timer = this.config.lostSeconds;
     this.progress = 0; this.sourceId = null;
     this.salvo = []; this.shotIndex = 0;
   }
+  // Challenge batteries read the current sortie row; other modes keep this.config
+  // and its original phase ramp. Always a fresh object, never a shared mutable row.
+  settings(game) {
+    if (game.challenge) {
+      const row = sortiePhase(game.phase);
+      return { acquireSeconds: row.acquireSeconds, warningSeconds: row.warningSeconds, reloadSeconds: row.reloadSeconds, patterns: row.patterns };
+    }
+    const config = this.config, phase = Math.min(game.phase, 5);
+    return { acquireSeconds: config.acquireSeconds - phase * .12, warningSeconds: config.warningSeconds,
+      reloadSeconds: config.reloadSeconds - phase * .1, patterns: FLAK_PATTERNS };
+  }
   // Picked from the engagement itself (battery, volley count and where the commander
-  // is), never the same solution twice in a row. It does not draw from the world's
-  // random stream, so enemy spawns and loot stay exactly as they would otherwise be.
-  choosePattern(game, source = { id: this.sourceId }) {
-    const options = FLAK_PATTERNS.filter(pattern => pattern !== this.pattern);
+  // is), never the same solution twice in a row unless only one is available. It does
+  // not draw from the world's random stream, so enemy spawns and loot stay exactly as
+  // they would otherwise be.
+  choosePattern(game, source = { id: this.sourceId }, patterns = this.settings(game).patterns) {
+    const options = patterns.length > 1 ? patterns.filter(pattern => pattern !== this.pattern) : patterns;
     let hash = 2166136261;
     for (const value of [source.id ?? 0, this.volleys, Math.round(game.player.x), Math.round(game.player.y)]) {
       hash = Math.imul(hash ^ (value | 0), 16777619) >>> 0;
@@ -41,8 +55,8 @@ export class AirDefense {
     }
     return options[hash % options.length];
   }
-  commitSalvo(player, pattern = 'predict', source = { x: this.aimX, y: this.aimY }) {
-    const { warningSeconds, flightSeconds, salvoCount, salvoInterval, salvoSpread, turnPrediction, turnDelay, radialSpacing, radialMin, radialMax } = this.config;
+  commitSalvo(player, pattern = 'predict', source = { x: this.aimX, y: this.aimY }, warningSeconds = this.warning) {
+    const { flightSeconds, salvoCount, salvoInterval, salvoSpread, turnPrediction, turnDelay, radialSpacing, radialMin, radialMax } = this.config;
     // Observe position and velocity, never future input. Every destination is
     // committed before the warning, so the matching manoeuvre defeats the solution.
     const vx = player.vx, vy = player.vy, speed = Math.hypot(vx, vy);
@@ -89,7 +103,7 @@ export class AirDefense {
     if (this.shotIndex < this.salvo.length) {
       this.state = 'salvo'; this.timer += this.interval;
     } else {
-      this.state = 'cooldown'; this.timer = this.config.reloadSeconds - Math.min(game.phase, 5) * .1;
+      this.state = 'cooldown'; this.timer = this.reload;
     }
   }
   update(game, dt) {
@@ -132,12 +146,14 @@ export class AirDefense {
       const dx = p.x - this.aimX, dy = p.y - this.aimY, d = Math.hypot(dx, dy);
       const step = Math.min(d, config.trackSpeed * dt);
       if (d > 0) { this.aimX += dx / d * step; this.aimY += dy / d * step; }
-      const acquisition = config.acquireSeconds - Math.min(game.phase, 5) * .12;
+      const settings = this.settings(game), acquisition = settings.acquireSeconds;
       this.timer = d - step <= config.trackTolerance ? this.timer + dt : Math.max(0, this.timer - dt);
       this.progress = Math.min(1, this.timer / acquisition);
       if (this.progress >= 1) {
-        this.state = 'locked'; this.timer = config.warningSeconds;
-        this.commitSalvo(p, this.choosePattern(game, source), source); this.volleys++;
+        // Snapshot the warning, the reload and the whole salvo trajectory at lock.
+        this.warning = settings.warningSeconds; this.reload = settings.reloadSeconds;
+        this.state = 'locked'; this.timer = this.warning;
+        this.commitSalvo(p, this.choosePattern(game, source, settings.patterns), source, this.warning); this.volleys++;
         game.onEvent({ type: 'radar-lock', x: source.x, y: source.y });
       }
     } else if (this.state === 'locked' || this.state === 'salvo') {

@@ -1,4 +1,6 @@
 // Presentation only: audio never consumes the simulation's seeded random stream.
+import { ControlRadio, CONTROL_RADIO_FILES } from './control-radio.mjs';
+import { EnemyRadio, RADIO_FILES } from './enemy-radio.mjs';
 export const MUSIC = Object.freeze({ menu: 'musicMenu', battle: 'musicGameplay', intense: 'musicBoss' });
 export const EFFECTS = Object.freeze({
   ui: { files: ['uiSelect'], volume: .28, cooldown: .09 },
@@ -53,10 +55,16 @@ export const AUDIO_FILES = Object.freeze([...new Set([
   ...Object.values(MUSIC).map(name => `audio/Music/${name}.ogg`),
   ...Object.values(EFFECTS).flatMap(effect => effect.files.map(name => `audio/Sound/${name}.ogg`)),
   ...Object.values(LOOPS).filter(loop => loop.file).map(loop => `audio/Sound/${loop.file}.ogg`),
+  ...RADIO_FILES,
+  ...CONTROL_RADIO_FILES,
 ])]);
 
 const TAU = Math.PI * 2;
-const AMBIENT_VOICES = 6, SEARCH_RANGE = 620;
+// Radio volumes are mix levels only: the voice-only -3 dB trim is already baked into the recordings.
+// Overheard enemy chatter sits below friendly control, which carries the player's orders.
+const AMBIENT_VOICES = 6, SEARCH_RANGE = 620, RADIO_VOLUME = .28, CONTROL_VOLUME = .4;
+// Game-time seconds a request may wait for its recording to finish decoding (a cold start).
+const CONTROL_HOLD = 1;
 const bounded = (value, fallback) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
 // A private generator so baked noise is identical every session and never
 // touches either the simulation's or the presentation's random source.
@@ -194,6 +202,7 @@ export class GameAudio {
     this.track = null; this.musicVoices = new Set(); this.boosting = false; this.gathering = false;
     this.loops = new Map(); this.loopVoices = new Set(); this.radarState = 'idle'; this.synthBuffers = new Map();
     this.reverb = null; this.threat = false; this.resetSchedule();
+    this.radio = new EnemyRadio(); this.radioVoice = null; this.control = new ControlRadio(); this.controlVoice = null; this.heldControl = null;
   }
   resetSchedule() {
     this.nextInfantry = 0; this.nextArtillery = 0; this.nextGun = 0; this.nextRifle = 0; this.nextFlyby = 0;
@@ -263,6 +272,8 @@ export class GameAudio {
   setThreat(threat) {
     if (this.threat === threat) return;
     this.threat = threat; this.applyMix();
+    // Warnings own the headset: a rising threat cuts any transmission at once.
+    if (threat) { this.stopRadio(); this.stopControl(); }
   }
   configure(patch) {
     this.settings = audioSettings({ ...this.settings, ...patch });
@@ -309,7 +320,7 @@ export class GameAudio {
   }
   stopEffects() {
     for (const voice of this.voices) voice.source.stop();
-    this.voices.clear();
+    this.voices.clear(); this.radioVoice = null; this.controlVoice = null; this.heldControl = null;
     for (const voice of this.loopVoices) voice.source.stop();
     this.loops.clear(); this.loopVoices.clear(); this.radarState = 'idle';
     this.setThreat(false);
@@ -318,7 +329,27 @@ export class GameAudio {
     this.boosting = false; this.gathering = false;
   }
   reset() {
-    this.stopEffects(); this.cooldowns.clear();
+    this.stopEffects(); this.cooldowns.clear(); this.radio.reset(); this.control.reset();
+  }
+  // Cuts one headset transmission ('radioVoice' or 'controlVoice') and forgets it.
+  cut(key) {
+    const voice = this[key];
+    this[key] = null;
+    if (voice && this.voices.has(voice)) { voice.source.stop(); this.voices.delete(voice); }
+  }
+  stopRadio() { this.cut('radioVoice'); }
+  stopControl() { this.cut('controlVoice'); this.heldControl = null; }
+  // A transmission is on air until it ends or is cut; a stale reference is released here.
+  onAir(key) {
+    if (this[key] && !this.voices.has(this[key])) this[key] = null;
+    return Boolean(this[key]);
+  }
+  // Dry, centred headset audio whose reference is released as soon as it ends.
+  transmit(key, name, buffer, options) {
+    const voice = this[key] = this.startVoice(name, buffer, { bus: this.effectsBus, ...options });
+    const ended = voice.source.onended;
+    voice.source.onended = () => { ended(); if (this[key] === voice) this[key] = null; };
+    return voice;
   }
   synth(name) {
     if (this.synthBuffers.has(name)) return this.synthBuffers.get(name);
@@ -470,6 +501,55 @@ export class GameAudio {
     this.cooldowns.set('flyby', context.currentTime); this.variants.set('flyby', index + 1);
     return true;
   }
+  // Friendly control on the headset: it outranks overheard chatter and yields only to warnings.
+  updateControl(game) {
+    // The observer always runs, so every new request is consumed even while nothing can be heard.
+    const fresh = this.control.update(game), held = this.heldControl;
+    // The newest request replaces one still waiting; anything that fails a check below is forgotten.
+    const call = fresh ?? held; this.heldControl = null;
+    if (!call || !this.ready() || this.threat || this.scene !== 'playing' || this.practice) return false;
+    // A waiting request must still be recent, its site still open and the player still flying.
+    const requests = game.bombardment?.requests;
+    if (call === held && !(game.player?.alive !== false && game.elapsed >= call.at && game.elapsed - call.at <= CONTROL_HOLD
+      && Array.isArray(requests) && requests.some(r => r?.id === call.id && r.state !== 'complete'))) return false;
+    // One exchange at a time; a request arriving mid-exchange is dropped, never queued.
+    if (this.onAir('controlVoice')) return false;
+    const buffer = this.buffers.get(call.file);
+    if (!buffer) {
+      // Only a recording still decoding on first sight (a cold start) may keep this request, briefly.
+      if (this.pending.has(call.file)) this.heldControl = call;
+      return false;
+    }
+    // The enemy channel is cut below, so only a full mix without it needs room.
+    if (this.voices.size - (this.onAir('radioVoice') ? 1 : 0) >= 14) {
+      // Background combat yields; warnings and the player's own sounds never do.
+      const ambient = [...this.voices].find(voice => voice.ambient);
+      if (!ambient) return false;
+      ambient.source.stop(); this.voices.delete(ambient);
+    }
+    this.stopRadio();
+    this.transmit('controlVoice', 'control', buffer, { volume: CONTROL_VOLUME, priority: true });
+    return true;
+  }
+  // Enemy pilots on an overheard channel: dry, centred headset audio.
+  updateRadio(game) {
+    // The observer always runs, so transitions are consumed even while nothing can be heard.
+    const call = this.radio.update(game);
+    if (!call || !this.ready() || this.threat || this.scene !== 'playing' || this.practice) return false;
+    // One speaker at a time and friendly control owns the channel; a blocked call is dropped, never queued.
+    if (this.onAir('controlVoice') || this.onAir('radioVoice')) return false;
+    const buffer = this.buffers.get(call.file);
+    if (!buffer) return false;
+    if (this.voices.size >= 14) {
+      // Background combat yields to a transmission; warnings and the player's own sounds never do.
+      const ambient = [...this.voices].find(voice => voice.ambient);
+      if (!ambient) return false;
+      ambient.source.stop(); this.voices.delete(ambient);
+    }
+    this.transmit('radioVoice', 'radio', buffer, { volume: RADIO_VOLUME });
+    this.radio.commit(call);
+    return true;
+  }
   handle(event, game) {
     if (event.type === 'start') this.reset();
     this.setScene(game.state, game.phase, game.practice);
@@ -480,7 +560,8 @@ export class GameAudio {
       case 'bomb-launch': this.play('launch', position); break;
       case 'bomb-impact': if (!event.final) this.play('impact', position); break;
       case 'strike-complete': this.play('destroy', position); break;
-      case 'strike-request': case 'interception': case 'sway': this.play('warning'); break;
+      // New strike requests are called in by friendly control from update(), without a second alert.
+      case 'interception': case 'sway': this.play('warning'); break;
       case 'radar-lock': this.play('gunSlew', position); break;
       case 'flak-fire': this.play('flakFire', position); break;
       case 'flak-impact': this.play('flakImpact', position); break;
@@ -492,13 +573,19 @@ export class GameAudio {
       case 'evolution-ready': this.play('ready'); break;
       case 'upgrade': this.play('upgrade'); break;
       case 'evolved': case 'mastery': this.play('evolved', { variant: Math.floor((game.level - 1) / 3) }); break;
-      case 'end': this.play(event.won ? 'victory' : 'death'); break;
+      // Reaching the time limit is not a victory: close the sortie with a neutral interface cue.
+      case 'end': this.play(event.reason === 'time-limit' || event.won ? 'upgrade' : 'death'); break;
     }
   }
   update(game) {
     this.setScene(game.state, game.phase, game.practice);
-    if (game.state !== 'playing') return;
+    // Outside ordinary combat both observers still consume what they see, so nothing is replayed later.
+    if (game.state !== 'playing') { this.radio.hold(); this.control.update(game); return; }
     this.updateBattlefield(game);
+    // After the radar, so a warning raised this frame already silences the radio;
+    // friendly control before enemy chatter, so a new request takes the channel first.
+    this.updateControl(game);
+    this.updateRadio(game);
     const boosting = Boolean(game.player.boosting), gathering = Boolean(game.player.gathering);
     if (boosting && !this.boosting) this.play('boost');
     if (gathering && !this.gathering) this.play('gather');

@@ -17,6 +17,7 @@ test('first upgrade cards vary by sortie, draw every eligible kind and never rep
       assert.equal(game.levelUp(), true);
       const cards = game.choices.map(u => u.id);
       assert.equal(cards.length, 3); assert.equal(new Set(cards).size, 3);
+      assert.ok(game.choices.some(u => u.combat), 'every opening hand offers a combat card');
       for (const card of cards) seen.add(card);
       hands.add([...cards].sort().join(','));
     }
@@ -64,8 +65,8 @@ function feed(game, value) {
 
 test('ready evolution leaves flight, size and energy collection running until the player asks', () => {
   const { game, events } = scene(), initialRadius = game.player.radius;
-  feed(game, 16); assert.equal(game.canEvolve(), false, 'the former cost is no longer enough');
-  feed(game, 32); const position = [game.player.x, game.player.y];
+  feed(game, 11); assert.equal(game.canEvolve(), false, 'the first pick requires twelve parts');
+  feed(game, 37); const position = [game.player.x, game.player.y];
   for (let i = 0; i < 120; i++) game.update(1 / 60, { dx: 1 });
   feed(game, 10);
   assert.equal(game.state, 'playing'); assert.ok(game.elapsed > 1.9);
@@ -79,23 +80,23 @@ test('ready evolution leaves flight, size and energy collection running until th
 
 test('an evolution request needs enough energy and an active living player', () => {
   const { game } = scene();
-  feed(game, 47); assert.equal(game.levelUp(), false); assert.equal(game.xp, 47); assert.equal(game.level, 1);
+  feed(game, 11); assert.equal(game.levelUp(), false); assert.equal(game.xp, 11); assert.equal(game.level, 1);
   feed(game, 1);
   for (const state of ['home', 'paused', 'upgrade', 'ended']) {
     game.state = state;
     assert.equal(game.canEvolve(), false); assert.equal(game.levelUp(), false);
-    assert.equal(game.xp, 48); assert.equal(game.level, 1);
+    assert.equal(game.xp, 12); assert.equal(game.level, 1);
   }
   game.state = 'playing'; game.player.alive = false;
-  assert.equal(game.levelUp(), false); assert.equal(game.xp, 48);
+  assert.equal(game.levelUp(), false); assert.equal(game.xp, 12);
   game.player.alive = true; assert.equal(game.levelUp(), true);
   assert.equal(game.state, 'upgrade'); assert.equal(game.xp, 0); assert.equal(game.level, 2);
 });
 
 test('each button activation buys one evolution and banked energy never chains choices automatically', () => {
   const { game, events } = scene(); feed(game, 150);
-  assert.equal(game.levelUp(), true); assert.equal(game.xp, 102); assert.equal(game.level, 2);
-  assert.equal(game.nextXp, 75);
+  assert.equal(game.levelUp(), true); assert.equal(game.xp, 138); assert.equal(game.level, 2);
+  assert.equal(game.nextXp, 18);
   const snapshot = [game.elapsed, game.player.x, game.player.radius, game.xp];
   assert.equal(game.levelUp(), false, 'a repeated activation cannot spend again during the choice');
   for (let i = 0; i < 60; i++) game.update(1 / 60, { boost: true });
@@ -103,12 +104,12 @@ test('each button activation buys one evolution and banked energy never chains c
   const chosen = game.choices[0].id;
   assert.equal(game.chooseUpgrade(0), true);
   assert.equal(game.state, 'playing'); assert.equal(game.canEvolve(), true);
-  assert.equal(game.level, 2); assert.equal(game.xp, 102); assert.equal(game.stats[chosen], 1);
+  assert.equal(game.level, 2); assert.equal(game.xp, 138); assert.equal(game.stats[chosen], 1);
   assert.equal(game.chooseUpgrade(0), false);
   for (let i = 0; i < 60; i++) game.update(1 / 60, { dx: 1 });
   assert.equal(game.level, 2); assert.equal(game.state, 'playing');
-  assert.equal(game.levelUp(), true); assert.equal(game.level, 3); assert.equal(game.xp, 27);
-  assert.equal(game.nextXp, 102);
+  assert.equal(game.levelUp(), true); assert.equal(game.level, 3); assert.equal(game.xp, 120);
+  assert.equal(game.nextXp, 24);
   assert.equal(events.filter(e => e.type === 'upgrade').length, 2);
 });
 
@@ -128,7 +129,7 @@ test('starting another run clears stored evolution energy and readiness', () => 
   const { game } = scene(); feed(game, 100); assert.equal(game.canEvolve(), true);
   game.startChallenge();
   assert.equal(game.canEvolve(), false); assert.equal(game.xp, 0); assert.equal(game.level, 1);
-  assert.equal(game.nextXp, 18); assert.deepEqual(game.choices, []);
+  assert.equal(game.nextXp, 12); assert.deepEqual(game.choices, []);
 });
 
 test('facility damage can be upgraded to its cap and resets for the next sortie', () => {

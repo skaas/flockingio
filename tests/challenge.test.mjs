@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Game, CHALLENGE_PHASES, WORLD_RADIUS, MAX_FLOCK, distance2 } from '../src/engine.mjs';
+import { SORTIE_DURATION, UPGRADE_COSTS } from '../src/rules.mjs';
+import { REPLAY_STEP } from '../src/replay.mjs';
 
 function setup(seed = 11) {
   const events = [];
@@ -18,15 +20,21 @@ test('the opening rewards come from absorption, never elapsed time or a free kil
   assert.equal(game.kills, 0);
 });
 
-test('challenge pressure advances quickly and does not finish at the old time limit', () => {
-  const { game } = setup();
+test('the challenge sortie advances through its phases and reaches its time cap on exactly the 18000th step', () => {
+  const { game, events } = setup();
+  assert.equal(game.duration, SORTIE_DURATION);
   for (let phase = 1; phase < CHALLENGE_PHASES.length; phase++) {
     game.elapsed = CHALLENGE_PHASES[phase] - .1; assert.equal(game.difficulty(), phase - 1);
     game.elapsed = CHALLENGE_PHASES[phase]; assert.equal(game.difficulty(), phase);
   }
-  game.elapsed = 1800; game.entities = [game.player]; game.spawnTimer = Infinity;
-  game.update(1 / 60);
-  assert.equal(game.state, 'playing'); assert.equal(game.won, false); assert.equal(game.phase, 5);
+  // No threats: an empty sky and no objectives, so only the clock can end the sortie.
+  game.elapsed = 0; game.bombardment.enabled = false; game.entities = [game.player]; game.spawnTimer = Infinity;
+  let ticks = 0;
+  while (game.state === 'playing' && ticks < 18100) { game.update(REPLAY_STEP); ticks++; }
+  assert.equal(ticks, 18000); assert.equal(game.elapsed, SORTIE_DURATION);
+  assert.equal(game.state, 'ended'); assert.equal(game.won, true); assert.equal(game.phase, 5);
+  game.update(REPLAY_STEP); assert.equal(game.elapsed, SORTIE_DURATION);
+  assert.equal(events.filter(e => e.type === 'end').length, 1);
 });
 
 test('new challenge arrivals stay inside the arena and away from the player, even near an edge', () => {
@@ -54,11 +62,12 @@ test('retries reset growth, upgrades, food, strays and difficulty; other modes k
   game.stats.cohesion = 4; game.level = 6; game.xp = 30; game.energy = 1; game.elapsed = 100;
   game.addFood({ x: 0, y: 0 }, 3); game.strays.push(game.player.boids.pop()); game.finish(false);
   game.startChallenge();
-  assert.equal(game.state, 'playing'); assert.equal(game.level, 1); assert.equal(game.nextXp, 18);
+  assert.equal(game.state, 'playing'); assert.equal(game.level, 1); assert.equal(game.nextXp, UPGRADE_COSTS[0]);
+  assert.equal(game.duration, SORTIE_DURATION);
   assert.equal(game.elapsed, 0); assert.equal(game.phase, 0); assert.equal(game.energy, 100);
   assert.equal(game.xp, 0); assert.equal(game.stats.cohesion, 0); assert.equal(game.food.length, 0);
   assert.equal(game.strays.length, 0); assert.equal(game.player.boids.length, 4);
-  game.start(1800); assert.equal(game.challenge, false); assert.equal(game.nextXp, 48);
+  game.start(1800); assert.equal(game.challenge, false); assert.equal(game.nextXp, UPGRADE_COSTS[0]); assert.equal(game.duration, 1800);
   game.elapsed = 30; assert.equal(game.difficulty(), 0);
   game.start(180); game.elapsed = 30; assert.equal(game.difficulty(), 1);
   game.startPractice(); assert.equal(game.challenge, false); assert.equal(game.entities.length, 1);
