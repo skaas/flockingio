@@ -1,6 +1,6 @@
 // One supported simulation and recording format. Increment when replay-affecting
 // behavior or the fingerprint changes; old recordings do not select old engines.
-export const RULES_VERSION = 19;
+export const RULES_VERSION = 20;
 export const SIMULATION_STEP = 1 / 60;
 export const WORLD_RADIUS = 1450;
 export const CONTRIBUTION_POINTS = Object.freeze({ objective: 1000, kill: 200 });

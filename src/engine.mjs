@@ -660,7 +660,7 @@ export class Game {
       let minX = e.x, maxX = e.x, minY = e.y, maxY = e.y;
       for (const b of e.boids) {
         this.influenceGrid.add({ x: b.x, y: b.y, vx: b.vx, vy: b.vy, owner: e.id, head: false, bird: b, allegianceGrace: b.allegianceGrace });
-        if (eligible) {
+        if (eligible && !this.fleetBattle) {
           minX = Math.min(minX, b.x); maxX = Math.max(maxX, b.x);
           minY = Math.min(minY, b.y); maxY = Math.max(maxY, b.y);
         }
@@ -697,6 +697,9 @@ export class Game {
         if (other.bird !== bird && !other.head) support += localWeight;
         return;
       }
+      // In fleet battle, a wing can defend its own flock but cannot recruit
+      // for its commander or pull a rival toward a remote part of the wing.
+      if (this.fleetBattle && !other.head) return;
       const rival = this.influenceFlocks.get(other.owner);
       if (!rival || rival.invincible > 0 || other.allegianceGrace > 0 || rival.count >= this.flockLimit) return;
       const w = (1 - d / range) * (other.head ? 2 : 1);

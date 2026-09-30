@@ -136,10 +136,24 @@ class ObservedHandlingGame extends FleetBattleGame {
 const fleetInput = tick => ({ dx: tick % 150 < 50 ? 1 : tick % 150 < 100 ? 0 : -1, dy: tick % 150 < 50 ? 0 : 1,
   boost: tick % 90 >= 20 && tick % 90 < 60, gather: tick % 120 >= 80 });
 
+function arrangeLongWing(game) {
+  const commander = game.player, rival = game.entities.find(e => e !== commander);
+  const length = DMath.hypot(commander.x - rival.x, commander.y - rival.y);
+  const awayX = (commander.x - rival.x) / length, awayY = (commander.y - rival.y) / length;
+  commander.boids.forEach((bird, index) => {
+    const gap = 60 * (index + 1);
+    bird.x = bird.px = commander.x + awayX * gap;
+    bird.y = bird.py = commander.y + awayY * gap;
+    bird.trail = [];
+  });
+  game.connectedFlock(commander);
+}
+
 test('shared flow values match per-call drone handling across ticks, fleets and a restore', () => {
   const seed = 0x5eed17;
   let shared = new ObservedHandlingGame(); shared.startFleetBattle(seed);
   const direct = new DirectHandlingGame(); direct.startFleetBattle(seed);
+  arrangeLongWing(shared); arrangeLongWing(direct);
   for (let tick = 0; tick < 420; tick++) {
     if (tick === 210) {
       // A restored game starts from fresh drones and a fresh pass.

@@ -56,6 +56,9 @@ export class FleetBattleGame extends Game {
   }
   // Fleets here have no size ceiling and grow only through local recruitment; other modes keep theirs.
   get flockLimit() { return this.fleetBattle ? Infinity : super.flockLimit; }
+  hasContact(entity, bird) {
+    return this.fleetBattle ? distance2(entity, bird) < 155 ** 2 : super.hasContact(entity, bird);
+  }
   reset(duration) {
     super.reset(duration);
     this.simulationTick = 0; this.simulationTimeOrigin = 0; this.simulationSeed = null;
