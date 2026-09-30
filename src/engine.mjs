@@ -28,27 +28,63 @@ export function movingCirclesHit(a, b, radius) {
     { x: a.x - b.x, y: a.y - b.y }) < radius * radius;
 }
 
+// Numeric row lookups avoid building a string for every queried cell. `cells`
+// remains the public string-keyed view, with the same arrays and key format.
+const gridRows = new WeakMap();
+// Influence bounds describe only the immutable pre-movement influence snapshot.
+const influenceBounds = new WeakMap();
+
 export class SpatialGrid {
-  constructor(size = 55) { this.size = size; this.cells = new Map(); this.cellPool = []; }
+  constructor(size = 55) { this.size = size; this.cells = new Map(); this.cellPool = []; gridRows.set(this, new Map()); }
   key(x, y) { return `${x},${y}`; }
   clear() {
     for (const cell of this.cells.values()) { cell.length = 0; this.cellPool.push(cell); }
     this.cells.clear();
+    gridRows.get(this).clear();
   }
   add(item) {
-    const key = this.key(Math.floor(item.x / this.size), Math.floor(item.y / this.size));
-    let cell = this.cells.get(key);
-    if (!cell) { cell = this.cellPool.pop() || []; this.cells.set(key, cell); }
+    const x = Math.floor(item.x / this.size), y = Math.floor(item.y / this.size);
+    const rows = gridRows.get(this);
+    let row = rows.get(y);
+    if (!row) { row = new Map(); rows.set(y, row); }
+    let cell = row.get(x);
+    if (!cell) {
+      cell = this.cellPool.pop() || [];
+      row.set(x, cell);
+      this.cells.set(this.key(x, y), cell);
+    }
     cell.push(item);
   }
   forEachNear(x, y, radius, visit) {
     const x0 = Math.floor((x - radius) / this.size), x1 = Math.floor((x + radius) / this.size);
     const y0 = Math.floor((y - radius) / this.size), y1 = Math.floor((y + radius) / this.size);
-    for (let iy = y0; iy <= y1; iy++) for (let ix = x0; ix <= x1; ix++) {
-      const cell = this.cells.get(this.key(ix, iy));
-      if (cell) for (const item of cell) if (visit(item) === false) return false;
+    const rows = gridRows.get(this);
+    for (let iy = y0; iy <= y1; iy++) {
+      const row = rows.get(iy);
+      if (!row) continue;
+      for (let ix = x0; ix <= x1; ix++) {
+        const cell = row.get(ix);
+        if (cell) for (const item of cell) if (visit(item) === false) return false;
+      }
     }
     return true;
+  }
+  // For hot loops that inspect every candidate, hand back cell arrays in the
+  // same y/x traversal order and let the caller iterate their items directly.
+  cellsNear(x, y, radius, out) {
+    out.length = 0;
+    const x0 = Math.floor((x - radius) / this.size), x1 = Math.floor((x + radius) / this.size);
+    const y0 = Math.floor((y - radius) / this.size), y1 = Math.floor((y + radius) / this.size);
+    const rows = gridRows.get(this);
+    for (let iy = y0; iy <= y1; iy++) {
+      const row = rows.get(iy);
+      if (!row) continue;
+      for (let ix = x0; ix <= x1; ix++) {
+        const cell = row.get(ix);
+        if (cell) out.push(cell);
+      }
+    }
+    return out;
   }
   near(x, y, radius) {
     const result = [];
@@ -113,6 +149,7 @@ export class Game {
     this.kills = 0; this.collected = 0; this.level = 1; this.xp = 0; this.nextXp = upgradeCost(this.level);
     this.maxFlock = FLEET.initial; this.energy = 100; this.phase = 0; this.spawnTimer = 3;
     this.influenceFlocks = new Map(); this.influenceGrid.clear(); this.strayGrid.clear();
+    influenceBounds.delete(this);
     this.influenceGroupScratch = new Map(); this.influenceGroupPool = [];
     this.pendingMembershipChecks = new Set();
     this.lostFollowers = 0; this.detachedFollowers = 0; this.recruitedFollowers = 0; this.swayWarningAt = 0;
@@ -608,13 +645,24 @@ export class Game {
   }
   prepareInfluence() {
     this.influenceGrid.clear(); this.influenceFlocks.clear();
+    const bounds = [];
     for (const e of this.entities) {
       if (!e.alive) continue;
       this.influenceFlocks.set(e.id, { id: e.id, x: e.x, y: e.y, count: e.boids.length, power: this.flockPower(e), recruitment: 1 + clamp(this.flockStats(e).cohesion, 0, 5) * .12, invincible: e.invincible });
       if (e.invincible > 0) continue;
       this.influenceGrid.add({ x: e.x, y: e.y, vx: e.vx, vy: e.vy, owner: e.id, head: true });
-      for (const b of e.boids) this.influenceGrid.add({ x: b.x, y: b.y, vx: b.vx, vy: b.vy, owner: e.id, head: false, bird: b, allegianceGrace: b.allegianceGrace });
+      const eligible = e.boids.length < this.flockLimit;
+      let minX = e.x, maxX = e.x, minY = e.y, maxY = e.y;
+      for (const b of e.boids) {
+        this.influenceGrid.add({ x: b.x, y: b.y, vx: b.vx, vy: b.vy, owner: e.id, head: false, bird: b, allegianceGrace: b.allegianceGrace });
+        if (eligible) {
+          minX = Math.min(minX, b.x); maxX = Math.max(maxX, b.x);
+          minY = Math.min(minY, b.y); maxY = Math.max(maxY, b.y);
+        }
+      }
+      if (eligible) bounds.push({ owner: e.id, minX, maxX, minY, maxY });
     }
+    influenceBounds.set(this, { grid: this.influenceGrid, flocks: this.influenceFlocks, bounds });
   }
   competingFlock(entity, bird, headDistance) {
     const home = entity.neutral ? null : this.influenceFlocks.get(entity.id);
@@ -623,6 +671,15 @@ export class Game {
     if ((!entity.neutral && (!home || home.invincible > 0)) || bird.allegianceGrace > 0 || this.influenceFlocks.size < (entity.neutral ? 1 : 2)) return null;
     const homePower = entity.neutral ? 1 : home.power;
     const range = bird.vision * (entity.neutral ? 1.25 : 1.65), localRange = bird.vision * 1.25, groups = this.influenceGroupScratch;
+    const snapshot = influenceBounds.get(this);
+    if (snapshot?.grid === this.influenceGrid && snapshot.flocks === this.influenceFlocks) {
+      let possible = false;
+      for (const box of snapshot.bounds) {
+        if (box.owner !== entity.id && bird.x + range >= box.minX && bird.x - range <= box.maxX &&
+          bird.y + range >= box.minY && bird.y - range <= box.maxY) { possible = true; break; }
+      }
+      if (!possible) return null;
+    }
     groups.clear();
     let support = 0;
     this.influenceGrid.forEachNear(bird.x, bird.y, range, other => {
@@ -687,27 +744,64 @@ export class Game {
     // Positions and velocities stay immutable until every bird has decided.
     // There is no formation index, rotating frame, path, or assigned destination.
     const updates = entity.flockUpdates || (entity.flockUpdates = []);
+    const nearCells = [];
     try {
     for (let birdIndex = 0; birdIndex < entity.boids.length; birdIndex++) {
       const b = entity.boids[birdIndex];
+      // Hovering remains are still recruitable, but never use neutral flocking.
+      if (entity.neutral && b.hovering) {
+        b.allegianceGrace = Math.max(0, b.allegianceGrace - dt);
+        b.looseCooldown = Math.max(0, b.looseCooldown - dt);
+        b.looseAge += dt;
+        const rival = this.competingFlock(entity, b, Infinity);
+        if (rival) {
+          if (b.influenceTarget !== rival.id) b.influence = 0;
+          b.influenceTarget = rival.id;
+          b.influence = Math.min(1, b.influence + dt * .65 * clamp(rival.ratio - .65, .5, 1.4));
+        } else {
+          b.influence = Math.max(0, b.influence - dt * .7);
+          const target = this.influenceFlocks.get(b.influenceTarget);
+          if (!target || target.invincible > 0 || target.count >= this.flockLimit) b.influence = 0;
+          if (b.influence === 0) b.influenceTarget = null;
+        }
+        continue;
+      }
       const separationRadius = 29 * (1 + s.separation * .18) * (1 - b.gather * .32);
       const vision = b.vision, forwardX = Math.cos(b.angle), forwardY = Math.sin(b.angle);
       let sepX = 0, sepY = 0, sumX = 0, sumY = 0, alignX = 0, alignY = 0, weight = 0, gatherSum = 0, gatherWeight = 0;
-      let upstreamBird = null, upstreamDistance = Infinity;
+      let upstreamBird = null, upstreamDistance = Infinity, upstreamDistance2 = Infinity;
       const neighbors = b.neighborScratch || (b.neighborScratch = []);
       const neighborRecords = b.neighborRecords || (b.neighborRecords = []);
       let neighborCount = 0;
-      grid.forEachNear(b.x, b.y, Math.max(vision, contactRange), other => {
-        if (other === b || other.owner !== entity.id) return;
+      const searchRadius = Math.max(vision, contactRange);
+      const roundingMargin = 1 + 1e-12;
+      const searchRadius2 = searchRadius * searchRadius * roundingMargin;
+      const separationRadius2 = separationRadius * separationRadius * roundingMargin;
+      const contactRange2 = contactRange * contactRange * roundingMargin;
+      grid.cellsNear(b.x, b.y, searchRadius, nearCells);
+      for (let cellIndex = 0; cellIndex < nearCells.length; cellIndex++) {
+        const cell = nearCells[cellIndex];
+        for (let itemIndex = 0; itemIndex < cell.length; itemIndex++) {
+        const other = cell[itemIndex];
+        if (other === b || other.owner !== entity.id) continue;
         let dx = other.x - b.x, dy = other.y - b.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > searchRadius2) continue;
+        // All separation contributors still pass through hypot. A farther bird
+        // can be discarded only once it also cannot improve upstream or top 7.
+        // Margin preserves exact ties and rounded radius boundaries.
+        if (neighborCount === 7 && d2 > separationRadius2 &&
+          (entity.neutral || !(other.linkDepth < b.linkDepth) || d2 > contactRange2 || d2 > upstreamDistance2) &&
+          d2 > neighbors[6].distance ** 2 * roundingMargin) continue;
         let distance = Math.hypot(dx, dy);
         // Relay the incoming flow along local contacts. Even a bird outside the
         // head's sight follows a nearby upstream neighbor, not a remote leader.
         if (!entity.neutral && other.linkDepth < b.linkDepth && distance < contactRange &&
           (distance < upstreamDistance || (distance === upstreamDistance && other.id < upstreamBird?.id))) {
           upstreamBird = other; upstreamDistance = distance;
+          upstreamDistance2 = distance * distance * roundingMargin;
         }
-        if (distance > vision) return;
+        if (distance > vision) continue;
         if (distance < .001) { const a = b.seed - other.seed; dx = Math.sin(a); dy = Math.cos(a); distance = 1; }
         // Avoid very close neighbors in every direction, including behind us.
         if (distance < separationRadius) {
@@ -733,7 +827,8 @@ export class Game {
             record.other = other; record.distance = distance; neighbors[insertion] = record;
           }
         }
-      });
+        }
+      }
       for (let i = 0; i < neighborCount; i++) {
         const { other, distance } = neighbors[i];
         // Birds nearer the incoming flow carry more information, but each bird
@@ -761,8 +856,6 @@ export class Game {
         if (!target || target.invincible > 0 || target.count >= this.flockLimit) b.influence = 0;
         if (b.influence === 0) b.influenceTarget = null;
       }
-      // A drone released by a defeated commander hovers: it can be recruited, never moved.
-      if (entity.neutral && b.hovering) continue;
       const loyalty = 1 - b.influence * .85;
       sumX *= loyalty; sumY *= loyalty; alignX *= loyalty; alignY *= loyalty; weight *= loyalty;
       // Only birds close enough to see the leader respond to it directly.

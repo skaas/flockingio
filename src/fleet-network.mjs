@@ -250,6 +250,8 @@ export class FleetNetworkSession {
 
   update(dt) {
     if (!this.connected || !this.replica || this.awaitingSnapshot || this.hidden) return 0;
+    // Time spent waiting for the next packet cannot become simulation time.
+    if (!this.frames.length) { this.frameClock = 0; return 0; }
     this.frameClock = Math.min(this.frameClock + Math.max(0, dt), 1 / 10);
     let advanced = 0;
     // Catch up a bounded number of confirmed frames after a render stall.
@@ -264,6 +266,7 @@ export class FleetNetworkSession {
       this.frameClock = Math.max(0, this.frameClock - 1 / 60);
       advanced++;
     }
+    if (!this.frames.length) this.frameClock = 0;
     if (advanced) {
       this.presentation.update(this.replica, this.entityId);
       this.onReplica(this.replica);

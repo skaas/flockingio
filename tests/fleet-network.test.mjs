@@ -124,6 +124,61 @@ test('a render stall catches up confirmed frames without forcing a resync', asyn
   await h.session.disconnect();
 });
 
+test('regular three-tick packets pace confirmed frames across displays after network waits', async () => {
+  const h = harness();
+  await h.session.join('조종사');
+  h.room.emit('welcome', { version: 1, entityId: 2, startedAt: 0 });
+  h.room.emit('snapshot', h.snapshot(10));
+  const resyncs = () => h.sent.filter(message => message.type === 'resync').length;
+  const initialResyncs = resyncs();
+  const deliver = firstTick => h.room.emit('frames', Array.from({ length: 3 }, (_, index) => ({
+    tick: firstTick + index, inputs: [],
+  })));
+  const display = expectedTick => {
+    assert.equal(h.session.update(1 / 60), 1);
+    assert.equal(h.session.replica.tick, expectedTick);
+  };
+
+  // The first packet arrives after two display updates with no confirmed data.
+  assert.equal(h.session.update(1 / 60), 0);
+  assert.equal(h.session.update(1 / 60), 0);
+  deliver(11);
+  display(11);
+  display(12);
+  display(13);
+
+  // Subsequent 20 Hz packets keep advancing one confirmed tick per display.
+  deliver(14);
+  display(14);
+  display(15);
+  display(16);
+  deliver(17);
+  display(17);
+  display(18);
+  display(19);
+
+  // A packet pause must not be repaid as a burst when delivery resumes.
+  for (let i = 0; i < 5; i++) {
+    assert.equal(h.session.update(1 / 60), 0);
+    assert.equal(h.session.replica.tick, 19);
+  }
+  deliver(20);
+  display(20);
+  display(21);
+  display(22);
+  // A long display interval also discards time left over after its last frame.
+  h.room.emit('frames', [{ tick: 23, inputs: [] }]);
+  assert.equal(h.session.update(.05), 1);
+  assert.equal(h.session.replica.tick, 23);
+  deliver(24);
+  display(24);
+  display(25);
+  display(26);
+  assert.equal(h.session.queuedFrames, 0);
+  assert.equal(resyncs(), initialResyncs);
+  await h.session.disconnect();
+});
+
 test('result blocks control, explicit respawn starts a new entity, stale callbacks cannot reclaim', async () => {
   const h = harness();
   await h.session.join('조종사');
