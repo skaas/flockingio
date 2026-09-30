@@ -7,7 +7,7 @@ import { drawGroundWar, drawBombs, drawAirDefense } from './battlefield-view.mjs
 import { RankingClient } from './ranking.mjs';
 import { normalizeNickname, validNickname, suggestNickname } from './identity.mjs';
 import { MouseFlightInput } from './mouse-input.mjs';
-import { FleetNetworkSession } from './fleet-network.mjs';
+import { FleetNetworkSession, preloadFleetNetworkModules } from './fleet-network.mjs';
 import { GameAudio } from './audio.mjs';
 import { loadSprites, sprite } from './sprites.mjs';
 import { VIEWPORT, fitViewport, clientToLogical } from './viewport.mjs';
@@ -280,15 +280,19 @@ function entryStatus(message) {
   $('connection-status').hidden = !message;
 }
 function showRoom(replica) {
-  if (!network?.view || (!network.ownEntity && !viewingRoom)) return;
-  game = network.view;
-  if (roomSeed !== replica.seed) {
+  const view = network?.view;
+  if (!view || (!network.ownEntity && !viewingRoom)) return;
+  game = view;
+  const entering = !viewingRoom;
+  const seedChanged = roomSeed !== replica.seed;
+  const entityChanged = displayedEntityId !== network.entityId;
+  if (seedChanged) {
     roomSeed = replica.seed;
     battlefield = generateBattlefield(battlefieldSeed(roomSeed));
     scenery.setBattlefield(battlefield);
     updateZone();
   }
-  if (displayedEntityId !== network.entityId) {
+  if (entityChanged) {
     displayedEntityId = network.entityId;
     resetInput(); showModal(null); cancelSignal();
     camera = { x: 0, y: 0, zoom: 1.2 }; cameraMotion = { x: 0, y: 0 };
@@ -299,11 +303,13 @@ function showRoom(replica) {
     canvas.focus({ preventScroll: true });
   }
   viewingRoom = true;
-  $('home').hidden = true; $('hud').hidden = false; $('pause').hidden = false; $('run-clock').hidden = false;
-  document.body.classList.add('playing', 'fleet-battle');
-  $('start').disabled = false;
-  entryStatus('');
-  updateHUD();
+  if (entering || entityChanged || seedChanged) {
+    $('home').hidden = true; $('hud').hidden = false; $('pause').hidden = false; $('run-clock').hidden = false;
+    document.body.classList.add('playing', 'fleet-battle');
+    $('start').disabled = false;
+    entryStatus('');
+    updateHUD();
+  }
 }
 let displayedEntityId = null;
 function connectToRoom(nickname) {
@@ -884,3 +890,8 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
+// Start code loading after the first home frame; a join can share either pending import.
+requestAnimationFrame(() => {
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(preloadFleetNetworkModules, { timeout: 1000 });
+  else setTimeout(preloadFleetNetworkModules, 0);
+});

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { FleetNetworkSession, FleetPresentation } from '../src/fleet-network.mjs';
 
-function harness() {
+function harness({ now, onStep } = {}) {
   const messages = new Map();
   const sent = [];
   const room = {
@@ -26,6 +26,7 @@ function harness() {
     ROOM_PROTOCOL_VERSION: 1,
     restorePublicSnapshot(snapshot) { return { seed: snapshot.seed, tick: snapshot.tick, game: snapshot.game }; },
     stepPublicFrame(replica, frame) {
+      onStep?.(replica, frame);
       if (frame.hash === 999) return false;
       replica.tick = frame.tick;
       return true;
@@ -36,6 +37,7 @@ function harness() {
     fetchConfig: async () => ({ ok: true, async json() { return { endpoint: '' }; } }),
     loadSdk: async () => ({ Client }),
     loadProtocol: async () => protocol,
+    now,
     onState: (status, detail) => states.push({ status, detail }),
   });
   const entity = (id, player = false) => ({ id, alive: true, player, boids: [{ id: id * 10 }], x: id, y: 0 });
@@ -47,16 +49,18 @@ function harness() {
   return { room, sent, joined, endpoints, states, session, entity, snapshot };
 }
 
-test('joins one room, disables SDK reconnection and requests the initial snapshot', async () => {
+test('joins one room and accepts the normal welcome and snapshot without a redundant resync', async () => {
   const h = harness();
   assert.equal(await h.session.join('조종사'), true);
   assert.deepEqual(h.joined, [{ id: 'flocking-main', options: { nickname: '조종사', protocol: 1 } }]);
   assert.deepEqual(h.endpoints, ['wss://game.example']);
   assert.equal(h.room.reconnection.enabled, false);
-  assert.deepEqual(h.sent[0], { type: 'resync', payload: {} });
+  assert.deepEqual(h.sent, []);
   assert.equal(h.session.canControl, false);
   h.room.emit('welcome', { version: 1, entityId: 2, startedAt: 5 });
   h.room.emit('snapshot', h.snapshot(6));
+  assert.equal(h.session.snapshotTimer, null);
+  assert.deepEqual(h.sent, []);
   assert.equal(h.session.canControl, true);
   assert.equal(h.session.view.player.id, 2);
   assert.equal(h.session.replica.game.player.id, 1);
@@ -66,6 +70,51 @@ test('joins one room, disables SDK reconnection and requests the initial snapsho
   assert.equal(h.session.survivalSeconds, 1 / 60);
   await h.session.disconnect();
   assert.equal(h.room.left, true);
+});
+
+test('synchronous SDK replay keeps the initial snapshot and clears its fallback', async () => {
+  const h = harness();
+  const register = h.room.onMessage.bind(h.room);
+  h.room.onMessage = (type, listener) => {
+    register(type, listener);
+    if (type === 'welcome') listener({ version: 1, entityId: 2, startedAt: 5 });
+    if (type === 'snapshot') listener(h.snapshot(6));
+  };
+  assert.equal(await h.session.join('조종사'), true);
+  assert.equal(h.session.replica.tick, 6);
+  assert.equal(h.session.canControl, true);
+  assert.equal(h.session.snapshotTimer, null);
+  assert.deepEqual(h.sent, []);
+  await h.session.disconnect();
+});
+
+test('missing either initial message triggers fallback, while disconnect cancels it', async () => {
+  const missingSnapshot = harness();
+  const missingWelcome = harness();
+  const disconnected = harness();
+  await Promise.all([
+    missingSnapshot.session.join('조종사'),
+    missingWelcome.session.join('조종사'),
+    disconnected.session.join('조종사'),
+  ]);
+  missingSnapshot.room.emit('welcome', { version: 1, entityId: 2, startedAt: 5 });
+  missingWelcome.room.emit('snapshot', missingWelcome.snapshot(6));
+  assert.equal(missingWelcome.session.awaitingSnapshot, true);
+  assert.ok(missingWelcome.session.snapshotTimer);
+  await disconnected.session.disconnect();
+  assert.equal(disconnected.session.snapshotTimer, null);
+
+  await new Promise(resolve => setTimeout(resolve, 1900));
+  for (const h of [missingSnapshot, missingWelcome]) {
+    assert.deepEqual(h.sent, [{ type: 'resync', payload: {} }]);
+    assert.equal(h.session.awaitingSnapshot, true);
+  }
+  assert.deepEqual(disconnected.sent, []);
+  missingSnapshot.room.emit('snapshot', missingSnapshot.snapshot(6));
+  missingWelcome.room.emit('welcome', { version: 1, entityId: 2, startedAt: 5 });
+  assert.equal(missingSnapshot.session.canControl, true);
+  assert.equal(missingWelcome.session.canControl, true);
+  await Promise.all([missingSnapshot.session.disconnect(), missingWelcome.session.disconnect()]);
 });
 
 test('sends authority-free inputs, neutralizes blur and repeats welcome without resetting sequence', async () => {
@@ -121,6 +170,64 @@ test('a render stall catches up confirmed frames without forcing a resync', asyn
   assert.equal(h.session.replica.tick, 70);
   assert.equal(h.session.queuedFrames, 0);
   assert.equal(resyncs(), initialResyncs);
+  await h.session.disconnect();
+});
+
+test('costly verified ticks stay in order across display updates within the replay budget', async () => {
+  let clock = 0;
+  const h = harness({ now: () => clock, onStep: () => { clock += 5; } });
+  await h.session.join('조종사');
+  h.room.emit('welcome', { version: 1, entityId: 2, startedAt: 0 });
+  h.room.emit('snapshot', h.snapshot(10));
+  h.room.emit('frames', Array.from({ length: 10 }, (_, index) => ({ tick: 11 + index, inputs: [] })));
+  assert.equal(h.session.update(.08), 2);
+  assert.equal(h.session.replica.tick, 12);
+  assert.equal(h.session.queuedFrames, 8);
+  assert.equal(h.session.update(1 / 60), 2);
+  assert.equal(h.session.replica.tick, 14);
+  for (let i = 0; i < 6; i++) h.session.update(1 / 60);
+  assert.equal(h.session.replica.tick, 20);
+  assert.equal(h.session.queuedFrames, 0);
+  assert.deepEqual(h.sent, []);
+  await h.session.disconnect();
+});
+
+test('30 Hz displays keep pace with two costly server ticks per update', async () => {
+  let clock = 0;
+  const h = harness({ now: () => clock, onStep: () => { clock += 9; } });
+  await h.session.join('조종사');
+  h.room.emit('welcome', { version: 1, entityId: 2, startedAt: 0 });
+  h.room.emit('snapshot', h.snapshot(10));
+  let peakQueue = 0;
+  for (let display = 0; display < 150; display++) {
+    const firstTick = 11 + display * 2;
+    h.room.emit('frames', [{ tick: firstTick, inputs: [] }, { tick: firstTick + 1, inputs: [] }]);
+    peakQueue = Math.max(peakQueue, h.session.queuedFrames);
+    const advanced = h.session.update(1 / 30);
+    assert.equal(advanced, 2);
+    assert.equal(h.session.replica.tick, firstTick + 1);
+    assert.equal(h.session.queuedFrames, 0);
+  }
+  assert.equal(peakQueue, 2);
+  assert.equal(h.session.replica.tick, 310);
+  assert.deepEqual(h.sent, []);
+  await h.session.disconnect();
+});
+
+test('one costly tick does not force another when no replay debt remains', async () => {
+  let clock = 0;
+  const h = harness({ now: () => clock, onStep: () => { clock += 20; } });
+  await h.session.join('조종사');
+  h.room.emit('welcome', { version: 1, entityId: 2, startedAt: 0 });
+  h.room.emit('snapshot', h.snapshot(10));
+  h.room.emit('frames', [{ tick: 11, inputs: [] }, { tick: 12, inputs: [] }]);
+  assert.equal(h.session.update(1 / 60), 1);
+  assert.equal(h.session.replica.tick, 11);
+  assert.equal(h.session.queuedFrames, 1);
+  assert.equal(h.session.update(1 / 60), 1);
+  assert.equal(h.session.replica.tick, 12);
+  assert.equal(h.session.queuedFrames, 0);
+  assert.deepEqual(h.sent, []);
   await h.session.disconnect();
 });
 

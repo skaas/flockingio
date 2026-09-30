@@ -5,8 +5,29 @@ const MAX_QUEUED_FRAMES = 120;
 const INPUT_INTERVAL = 1 / 20;
 const NEUTRAL_INPUT = Object.freeze({ dx: 0, dy: 0, boost: false, gather: false });
 
-const defaultSdk = () => import('/vendor/colyseus-sdk.mjs');
-const defaultProtocol = () => import('./fleet-room-protocol.mjs');
+let sdkModulePromise;
+let protocolModulePromise;
+
+function defaultSdk() {
+  if (!sdkModulePromise) sdkModulePromise = import('/vendor/colyseus-sdk.mjs').catch(error => {
+    sdkModulePromise = null;
+    throw error;
+  });
+  return sdkModulePromise;
+}
+
+function defaultProtocol() {
+  if (!protocolModulePromise) protocolModulePromise = import('./fleet-room-protocol.mjs').catch(error => {
+    protocolModulePromise = null;
+    throw error;
+  });
+  return protocolModulePromise;
+}
+
+// Warm only code needed for a later join. Failed imports are retried by that join.
+export function preloadFleetNetworkModules() {
+  return Promise.allSettled([defaultSdk(), defaultProtocol()]);
+}
 
 function endpointFromConfig(config, origin) {
   const url = new URL(config?.endpoint || origin, origin);
@@ -70,6 +91,7 @@ export class FleetNetworkSession {
     fetchConfig = (...args) => fetch(...args),
     loadSdk = defaultSdk,
     loadProtocol = defaultProtocol,
+    now = () => performance.now(),
     onEvent = () => {},
     onState = () => {},
     onReplica = () => {},
@@ -81,6 +103,7 @@ export class FleetNetworkSession {
     this.fetchConfig = fetchConfig;
     this.loadSdk = loadSdk;
     this.loadProtocol = loadProtocol;
+    this.now = now;
     this.onEvent = onEvent;
     this.onState = onState;
     this.onReplica = onReplica;
@@ -103,6 +126,8 @@ export class FleetNetworkSession {
     this.frameClock = 0;
     this.hidden = false;
     this.awaitingSnapshot = false;
+    this.initialSyncPending = false;
+    this.initialSnapshotReceived = false;
     this.awaitingRespawn = false;
     this.joinPromise = null;
     this.startedAt = null;
@@ -157,7 +182,15 @@ export class FleetNetworkSession {
         // connection must return to the entry screen, never reclaim this fleet.
         if (room.reconnection) room.reconnection.enabled = false;
         this.room = room;
-        // Register synchronously before requesting the initial snapshot.
+        // The server sends welcome and snapshot on join. Arm the fallback first:
+        // registering an SDK handler may replay either message synchronously.
+        this.entityId = null;
+        this.replica = null;
+        this.initialSyncPending = true;
+        this.initialSnapshotReceived = false;
+        this.awaitingSnapshot = true;
+        this.snapshotAttempts = 0;
+        this.armSnapshotTimeout();
         room.onMessage('welcome', data => this.receive(epoch, 'welcome', data));
         room.onMessage('snapshot', data => this.receive(epoch, 'snapshot', data));
         room.onMessage('frames', data => this.receive(epoch, 'frames', data));
@@ -167,18 +200,21 @@ export class FleetNetworkSession {
         room.onLeave?.(() => this.lost(epoch));
         room.onDrop?.(() => this.lost(epoch));
         room.onError?.((code, message) => this.lost(epoch, { code, message }));
+        if (epoch !== this.epoch) return false;
         this.setState('connected');
-        this.requestSnapshot();
         return true;
       } catch (error) {
         if (epoch !== this.epoch) return false;
         clearTimeout(this.joinTimer); this.joinTimer = null;
+        clearTimeout(this.snapshotTimer); this.snapshotTimer = null;
     if (room && (!room.connection || room.connection.isOpen === true)) {
       Promise.resolve().then(() => {
         if (!room.connection || room.connection.isOpen === true) return room.leave();
       }).catch(() => {});
     }
         this.room = null;
+        this.awaitingSnapshot = false;
+        this.initialSyncPending = false;
         this.setState('error', connectionError(error));
         return false;
       } finally {
@@ -203,6 +239,7 @@ export class FleetNetworkSession {
           this.lastResult = null;
           clearTimeout(this.respawnTimer); this.respawnTimer = null;
         }
+        this.finishInitialSync();
         this.onWelcome(data);
       } else if (type === 'snapshot') {
         if (data?.version !== 1 || !Number.isSafeInteger(data.tick)) throw new Error('스냅샷 오류');
@@ -213,9 +250,13 @@ export class FleetNetworkSession {
         this.filler = new Set(data.filler || []);
         this.frames.length = 0;
         this.frameClock = 0;
-        this.awaitingSnapshot = false;
-        this.snapshotAttempts = 0;
-        clearTimeout(this.snapshotTimer); this.snapshotTimer = null;
+        if (this.initialSyncPending) this.initialSnapshotReceived = true;
+        this.awaitingSnapshot = this.initialSyncPending && this.entityId === null;
+        if (this.initialSyncPending) this.finishInitialSync();
+        else {
+          this.snapshotAttempts = 0;
+          clearTimeout(this.snapshotTimer); this.snapshotTimer = null;
+        }
         this.presentation.update(restored, this.entityId);
         this.onReplica(restored);
       } else if (type === 'frames') {
@@ -254,6 +295,7 @@ export class FleetNetworkSession {
     if (!this.frames.length) { this.frameClock = 0; return 0; }
     this.frameClock = Math.min(this.frameClock + Math.max(0, dt), 1 / 10);
     let advanced = 0;
+    const replayStartedAt = this.now();
     // Catch up a bounded number of confirmed frames after a render stall.
     while ((this.frameClock >= 1 / 60 || this.frames.length > 3) && this.frames.length && advanced < 6) {
       const frame = this.frames.shift();
@@ -265,6 +307,11 @@ export class FleetNetworkSession {
       } catch { this.resync(); break; }
       this.frameClock = Math.max(0, this.frameClock - 1 / 60);
       advanced++;
+      // A costly tick can exceed the budget on its own. If work is still due,
+      // allow one more whole tick so 30 Hz displays can keep pace with 60 Hz
+      // frames, but never turn that exception into a long replay burst.
+      const due = this.frameClock >= 1 / 60 || this.frames.length > 3;
+      if (this.now() - replayStartedAt >= 8 && (advanced >= 2 || !due)) break;
     }
     if (!this.frames.length) this.frameClock = 0;
     if (advanced) {
@@ -318,11 +365,25 @@ export class FleetNetworkSession {
     this.awaitingSnapshot = true;
     this.frames.length = 0;
     this.frameClock = 0;
+    this.armSnapshotTimeout();
     this.room.send('resync', {});
+  }
+
+  finishInitialSync() {
+    if (!this.initialSyncPending || !this.initialSnapshotReceived || this.entityId === null) return;
+    this.initialSyncPending = false;
+    this.awaitingSnapshot = false;
+    this.snapshotAttempts = 0;
+    clearTimeout(this.snapshotTimer); this.snapshotTimer = null;
+  }
+
+  armSnapshotTimeout() {
     clearTimeout(this.snapshotTimer);
     const epoch = this.epoch;
     this.snapshotTimer = setTimeout(() => {
-      if (epoch !== this.epoch || !this.awaitingSnapshot || this.hidden) return;
+      if (epoch !== this.epoch) return;
+      this.snapshotTimer = null;
+      if ((!this.awaitingSnapshot && !this.initialSyncPending) || this.hidden) return;
       if (++this.snapshotAttempts >= 4) {
         this.lost(epoch, { code: 'sync-timeout', message: '전장 정보를 받지 못했습니다. 다시 입장해 주세요.' });
       } else this.requestSnapshot();
@@ -360,6 +421,8 @@ export class FleetNetworkSession {
     this.joinPromise = null;
     this.frames.length = 0;
     this.awaitingSnapshot = false;
+    this.initialSyncPending = false;
+    this.initialSnapshotReceived = false;
     this.awaitingRespawn = false;
     this.entityId = null;
     if (room && (!room.connection || room.connection.isOpen === true)) {
@@ -386,6 +449,8 @@ export class FleetNetworkSession {
     this.filler.clear();
     this.presentation.reset();
     this.awaitingSnapshot = false;
+    this.initialSyncPending = false;
+    this.initialSnapshotReceived = false;
     this.awaitingRespawn = false;
     this.setState('idle');
     if (room && (!room.connection || room.connection.isOpen === true)) {

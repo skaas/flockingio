@@ -44,6 +44,75 @@ async function setup(settings, options = {}) {
   return { audio, context };
 }
 
+test('cold start defers audio work, bounds fetch plus decode, and prioritizes desired music and live cues', async () => {
+  const scheduled = [], decoding = [], waiting = new Map(), context = new Context();
+  let releaseRest = false;
+  context.decodeAudioData = data => {
+    decoding.push(data);
+    if (releaseRest) return Promise.resolve({ data, duration: 16 });
+    return new Promise(resolve => waiting.set(data, () => resolve({ data, duration: 16 })));
+  };
+  const audio = new GameAudio({}, { createContext: () => context,
+    schedule: task => scheduled.push(task),
+    fetchAsset: async url => ({ ok: true, arrayBuffer: async () => url.pathname }) });
+  audio.unlock();
+  assert.equal(decoding.length, 0, 'unlock does not fetch or decode in the gesture task');
+  assert.equal(scheduled.length, 1);
+  audio.setScene('playing');
+  scheduled.shift()();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(decoding.map(path => path.split('/').pop()), ['musicGameplay.ogg', 'musicMenu.ogg']);
+  assert.equal(audio.activeLoads, 2);
+  const gameplay = audio.load('audio/Music/musicGameplay.ogg');
+  assert.equal(gameplay, audio.load('audio/Music/musicGameplay.ogg', { priority: 2 }), 'queued/in-flight loads deduplicate');
+  audio.setScene('playing', 3);
+  assert.equal(audio.play('death'), false, 'a live cue is dropped if it has not decoded');
+  waiting.get(decoding[0])(); await gameplay;
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(decoding[2].split('/').pop(), 'musicBoss.ogg', 'desired music takes the freed slot first');
+  assert.equal(audio.activeLoads, 2);
+  const menuPath = decoding[1];
+  waiting.get(menuPath)(); await audio.pending.get('audio/Music/musicMenu.ogg');
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(decoding[3].split('/').pop(), 'colDeathStingST.ogg', 'live cue precedes background preload');
+  assert.equal(audio.voices.size, 0, 'the dropped cue is not replayed after decoding');
+  releaseRest = true;
+  for (const resolve of waiting.values()) resolve();
+  await Promise.all([...audio.pending.values()]);
+  assert.equal(audio.activeLoads, 0);
+  assert.equal(audio.buffers.size, AUDIO_FILES.length);
+  assert.equal(audio.voices.size, 0);
+});
+
+test('a failed load releases its slot and remains deduplicated', async () => {
+  const scheduled = [], waiting = new Map(), fetched = [], context = new Context();
+  const audio = new GameAudio({ enabled: false }, { schedule: task => scheduled.push(task),
+    fetchAsset: url => {
+      const path = url.pathname.split('/').pop(); fetched.push(path);
+      return new Promise(resolve => waiting.set(path, resolve));
+    } });
+  audio.context = context;
+  const first = audio.load('audio/Sound/one.ogg');
+  assert.equal(first, audio.load('audio/Sound/one.ogg'));
+  const second = audio.load('audio/Sound/two.ogg');
+  const third = audio.load('audio/Sound/three.ogg');
+  assert.deepEqual(fetched, []);
+  scheduled.shift()();
+  assert.deepEqual(fetched, ['one.ogg', 'two.ogg']);
+  assert.equal(audio.activeLoads, 2);
+  waiting.get('one.ogg')({ ok: false });
+  assert.equal(await first, null);
+  assert.deepEqual(fetched, ['one.ogg', 'two.ogg', 'three.ogg']);
+  assert.equal(audio.activeLoads, 2);
+  waiting.get('two.ogg')({ ok: true, arrayBuffer: async () => 'two' });
+  waiting.get('three.ogg')({ ok: true, arrayBuffer: async () => 'three' });
+  assert.equal((await second).data, 'two');
+  assert.equal((await third).data, 'three');
+  assert.equal(audio.activeLoads, 0);
+  assert.equal(await audio.load('audio/Sound/one.ogg'), null);
+  assert.deepEqual(fetched, ['one.ogg', 'two.ogg', 'three.ogg']);
+});
+
 test('selected production assets exist and contain Ogg data', async () => {
   let bytes = 0;
   for (const path of AUDIO_FILES) {
@@ -73,16 +142,18 @@ test('audio waits for a gesture, decodes once, and disabled audio never creates 
 test('late decoding follows the current scene and cannot resurrect an obsolete track or effect', async () => {
   const waiting = new Map(), context = new Context();
   const audio = new GameAudio({}, { createContext: () => context,
-    fetchAsset: url => new Promise(resolve => waiting.set(url.pathname.split('/').pop(), () => resolve({ ok: true, arrayBuffer: async () => url.pathname }))) });
+    fetchAsset: url => /\/audio\/Music\/music(?:Menu|Gameplay)\.ogg$/.test(url.pathname)
+      ? new Promise(resolve => waiting.set(url.pathname.split('/').pop(), () => resolve({ ok: true, arrayBuffer: async () => url.pathname })))
+      : Promise.resolve({ ok: true, arrayBuffer: async () => url.pathname }) });
   audio.unlock(); audio.setScene('playing');
   assert.equal(audio.play('impact'), false);
   audio.setScene('ended');
+  await new Promise(resolve => setTimeout(resolve, 0));
   waiting.get('musicGameplay.ogg')();
   await audio.pending.get('audio/Music/musicGameplay.ogg');
   assert.equal(audio.track, null);
   waiting.get('musicMenu.ogg')(); await audio.pending.get('audio/Music/musicMenu.ogg');
   assert.equal(audio.track.name, 'musicMenu'); assert.equal(context.sources.length, 1);
-  for (const resolve of waiting.values()) resolve();
   await Promise.all([...audio.pending.values()]);
   assert.equal(context.sources.length, 1, 'no delayed explosion is played');
 });
@@ -705,6 +776,7 @@ async function coldControl() {
   scene.audio.buffers.delete(file);
   scene.audio.fetchAsset = url => new Promise(resolve => { arrive = () => resolve({ ok: true, arrayBuffer: async () => url.pathname }); });
   const loading = scene.audio.load(file);
+  await new Promise(resolve => setTimeout(resolve, 0));
   return { ...scene, decode: async () => { arrive(); await loading; } };
 }
 

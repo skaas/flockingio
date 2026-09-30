@@ -193,10 +193,11 @@ export const audioSettings = (value = {}) => ({
 
 export class GameAudio {
   constructor(settings, { createContext = () => new (globalThis.AudioContext || globalThis.webkitAudioContext)(),
-    fetchAsset = url => fetch(url), random = Math.random } = {}) {
+    fetchAsset = url => fetch(url), random = Math.random, schedule = task => setTimeout(task, 0) } = {}) {
     this.settings = audioSettings(settings);
-    this.createContext = createContext; this.fetchAsset = fetchAsset; this.random = random;
+    this.createContext = createContext; this.fetchAsset = fetchAsset; this.random = random; this.schedule = schedule;
     this.context = null; this.buffers = new Map(); this.pending = new Map(); this.failed = new Set();
+    this.loadQueue = []; this.activeLoads = 0; this.loadScheduled = false;
     this.voices = new Set(); this.cooldowns = new Map(); this.variants = new Map();
     this.scene = 'home'; this.phase = 0; this.practice = false; this.hidden = false;
     this.track = null; this.musicVoices = new Set(); this.boosting = false; this.gathering = false;
@@ -228,7 +229,8 @@ export class GameAudio {
           this.reverb.connect(convolver); convolver.connect(wet); wet.connect(this.effectsBus);
         }
         this.master.gain.value = 0; this.applyMix();
-        // Decode once, share every buffer, and never delay game startup for audio.
+        // Enqueue the preload now; fetch and decode begin in a later task so
+        // connection setup can run after the gesture without competing with audio.
         for (const path of AUDIO_FILES) this.load(path);
       }
       if (this.context.state !== 'running') {
@@ -237,20 +239,54 @@ export class GameAudio {
       this.syncMusic();
     } catch { /* Unsupported audio must not interrupt play. */ }
   }
-  async load(path) {
-    if (this.buffers.has(path)) return this.buffers.get(path);
-    if (this.pending.has(path)) return this.pending.get(path);
-    if (this.failed.has(path)) return null;
-    const task = (async () => {
-      try {
-        const response = await this.fetchAsset(new URL(`../${path}`, import.meta.url));
-        if (!response.ok) throw new Error('Audio unavailable');
-        const buffer = await this.context.decodeAudioData(await response.arrayBuffer());
-        this.buffers.set(path, buffer); this.syncMusic(); return buffer;
-      } catch { this.failed.add(path); return null; }
-      finally { this.pending.delete(path); }
-    })();
-    this.pending.set(path, task); return task;
+  load(path, { priority = 0 } = {}) {
+    if (this.buffers.has(path)) return Promise.resolve(this.buffers.get(path));
+    if (this.failed.has(path)) return Promise.resolve(null);
+    const pending = this.pending.get(path);
+    if (pending) {
+      const queued = this.loadQueue.find(entry => entry.path === path);
+      if (queued && priority > 0 && priority >= queued.priority) {
+        this.loadQueue.splice(this.loadQueue.indexOf(queued), 1);
+        queued.priority = priority; this.enqueueLoad(queued, true);
+      }
+      return pending;
+    }
+    const task = new Promise(resolve => {
+      this.enqueueLoad({ path, priority, resolve });
+    });
+    this.pending.set(path, task);
+    if (!this.loadScheduled) {
+      this.loadScheduled = true;
+      this.schedule(() => { this.loadScheduled = false; this.pumpLoads(); });
+    }
+    return task;
+  }
+  enqueueLoad(entry, aheadOfPeers = false) {
+    const after = this.loadQueue.findIndex(queued => queued.priority < entry.priority
+      || (aheadOfPeers && queued.priority === entry.priority));
+    this.loadQueue.splice(after < 0 ? this.loadQueue.length : after, 0, entry);
+  }
+  pumpLoads() {
+    while (this.activeLoads < 2 && this.loadQueue.length) {
+      const entry = this.loadQueue.shift();
+      this.activeLoads++;
+      this.runLoad(entry);
+    }
+  }
+  async runLoad({ path, resolve }) {
+    let buffer = null;
+    try {
+      const response = await this.fetchAsset(new URL(`../${path}`, import.meta.url));
+      if (!response.ok) throw new Error('Audio unavailable');
+      buffer = await this.context.decodeAudioData(await response.arrayBuffer());
+      this.buffers.set(path, buffer); this.syncMusic();
+    } catch { this.failed.add(path); }
+    finally {
+      this.pending.delete(path);
+      this.activeLoads--;
+      resolve(buffer);
+      this.pumpLoads();
+    }
   }
   ready() {
     return Boolean(this.context && this.context.state === 'running' && this.settings.enabled && this.settings.effects && !this.hidden);
@@ -301,8 +337,8 @@ export class GameAudio {
     const name = this.scene === 'home' || this.scene === 'ended' ? MUSIC.menu
       : !this.practice && this.phase >= 3 ? MUSIC.intense : MUSIC.battle;
     if (this.track?.name === name) return;
-    const buffer = this.buffers.get(`audio/Music/${name}.ogg`);
-    if (!buffer) return;
+    const path = `audio/Music/${name}.ogg`, buffer = this.buffers.get(path);
+    if (!buffer) { this.load(path, { priority: 2 }); return; }
     // Crossfade only after the next track is decoded. Rapid scene changes
     // retire all prior sources, so retries cannot accumulate looping music.
     for (const voice of this.musicVoices) {
@@ -371,7 +407,10 @@ export class GameAudio {
     let voice = this.loops.get(name);
     if (!voice) {
       const buffer = spec.tone ? this.synth(spec.tone) : this.buffers.get(`audio/Sound/${spec.file}.ogg`);
-      if (!buffer) return; // A later update starts only if this situation still exists.
+      if (!buffer) {
+        if (spec.file) this.load(`audio/Sound/${spec.file}.ogg`, { priority: 1 });
+        return; // A later update starts only if this situation still exists.
+      }
       const source = context.createBufferSource(), gain = context.createGain();
       const panner = spec.bus === 'ambience' ? context.createStereoPanner?.() : null;
       const filter = cutoff !== null ? context.createBiquadFilter?.() : null;
@@ -457,7 +496,10 @@ export class GameAudio {
     const index = effect.tone ? 0 : variant === undefined ? (this.variants.get(name) ?? 0) % effect.files.length : Math.max(0, Math.min(effect.files.length - 1, variant));
     const buffer = effect.tone ? this.synth(effect.tone) : this.buffers.get(`audio/Sound/${effect.files[index]}.ogg`);
     // Drop unloaded effects instead of replaying a backlog after decoding.
-    if (!buffer) return false;
+    if (!buffer) {
+      if (!effect.tone) this.load(`audio/Sound/${effect.files[index]}.ogg`, { priority: 1 });
+      return false;
+    }
     volume *= effect.levels?.[index] ?? 1;
     if (this.voices.size >= 14) {
       if (!effect.priority) return false;
@@ -486,7 +528,7 @@ export class GameAudio {
     if (!this.ready() || this.ambientVoices() >= AMBIENT_VOICES) return false;
     const index = (this.variants.get('flyby') ?? 0) % effect.files.length;
     const buffer = this.buffers.get(`audio/Sound/${effect.files[index]}.ogg`);
-    if (!buffer) return false;
+    if (!buffer) { this.load(`audio/Sound/${effect.files[index]}.ogg`, { priority: 1 }); return false; }
     const duration = 7 + this.random() * 4, side = this.random() < .5 ? -1 : 1;
     const peak = effect.volume * effect.levels[index];
     const voice = this.startVoice('flyby', buffer, { volume: 0, pan: -.9 * side, cutoff: 450, rate: 1.07,
@@ -517,7 +559,7 @@ export class GameAudio {
     const buffer = this.buffers.get(call.file);
     if (!buffer) {
       // Only a recording still decoding on first sight (a cold start) may keep this request, briefly.
-      if (this.pending.has(call.file)) this.heldControl = call;
+      if (this.pending.has(call.file)) { this.load(call.file, { priority: 1 }); this.heldControl = call; }
       return false;
     }
     // The enemy channel is cut below, so only a full mix without it needs room.
@@ -539,7 +581,7 @@ export class GameAudio {
     // One speaker at a time and friendly control owns the channel; a blocked call is dropped, never queued.
     if (this.onAir('controlVoice') || this.onAir('radioVoice')) return false;
     const buffer = this.buffers.get(call.file);
-    if (!buffer) return false;
+    if (!buffer) { this.load(call.file, { priority: 1 }); return false; }
     if (this.voices.size >= 14) {
       // Background combat yields to a transmission; warnings and the player's own sounds never do.
       const ambient = [...this.voices].find(voice => voice.ambient);
