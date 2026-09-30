@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineRoom, defineServer, matchMaker } from 'colyseus';
@@ -92,7 +92,22 @@ export async function startColyseusServer({
   return server;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+async function isMainEntry() {
+  const entry = await realpath(fileURLToPath(import.meta.url));
+  // PM2 fork mode loads ESM through ProcessContainerFork.js, so argv[1] is
+  // its loader while pm_exec_path identifies the application entry.
+  for (const path of [process.argv[1], process.env.pm_exec_path]) {
+    if (!path) continue;
+    try {
+      if (await realpath(resolve(path)) === entry) return true;
+    } catch {
+      // A missing or inaccessible launcher path cannot identify this module.
+    }
+  }
+  return false;
+}
+
+if (await isMainEntry()) {
   await startColyseusServer();
   console.log(`Flocking Colyseus room ready: ${ROOM_ID}`);
 }

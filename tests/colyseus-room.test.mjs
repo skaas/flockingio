@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@colyseus/sdk';
 import {
   FrameBatcher,
@@ -91,6 +92,103 @@ async function waitForHealth(port, child) {
   }
   throw new Error('Server did not become healthy');
 }
+
+function waitForExit(child, timeoutMs = 5000) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve([child.exitCode, child.signalCode]);
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Child did not exit')), timeoutMs);
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve([code, signal]);
+    });
+    child.once('error', error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = waitForExit(child, 2500);
+  child.kill('SIGTERM');
+  try {
+    await exited;
+  } catch {
+    child.kill('SIGKILL');
+    await waitForExit(child, 2500).catch(() => {});
+  }
+}
+
+const esmImport = "await import('./server/colyseus.mjs')";
+const pm2Import = "const { pathToFileURL } = await import('node:url'); await import(pathToFileURL(process.env.pm_exec_path))";
+
+test('PM2 fork-style ESM loader starts the room named by pm_exec_path',
+  { timeout: 20000 }, async () => {
+    const port = await freePort();
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', pm2Import], {
+      cwd: new URL('..', import.meta.url),
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOST: '127.0.0.1',
+        pm_exec_path: fileURLToPath(new URL('../server/colyseus.mjs', import.meta.url)),
+      },
+      stdio: 'ignore',
+    });
+    let room;
+    try {
+      await waitForHealth(port, child);
+      const client = new Client(`http://127.0.0.1:${port}`);
+      room = await withTimeout(
+        client.joinById('flocking-main', { nickname: 'PM2 probe', protocol: 1 }),
+        5000,
+        'PM2 room join timed out',
+      );
+      room.onMessage('*', () => {});
+      assert.equal(room.roomId, 'flocking-main');
+    } finally {
+      if (room) await withTimeout(room.leave(), 500, 'PM2 room leave timed out').catch(() => {});
+      await stopChild(child);
+    }
+  });
+
+test('ordinary ESM import does not start a listener', { timeout: 10000 }, async () => {
+  const port = await freePort();
+  const env = { ...process.env, PORT: String(port), HOST: '127.0.0.1' };
+  delete env.pm_exec_path;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', esmImport], {
+    cwd: new URL('..', import.meta.url),
+    env,
+    stdio: 'ignore',
+  });
+  try {
+    const [code, signal] = await waitForExit(child);
+    assert.equal(code, 0);
+    assert.equal(signal, null);
+    await assert.rejects(fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(1000),
+    }));
+  } finally {
+    await stopChild(child);
+  }
+});
 
 test('actual SDK joins the eager room, receives resync, and re-entry gets fresh authority',
   { timeout: 25000 }, async () => {
