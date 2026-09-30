@@ -10,7 +10,7 @@ import {
   getActiveColyseusRoom,
   roomBootstrapOptions,
 } from './colyseus-room.mjs';
-import { AUDIO_FILES } from '../src/audio.mjs';
+import { AUDIO_FILES } from '../src/fleet-audio.mjs';
 import { IMAGE_FILES } from '../src/sprites.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));

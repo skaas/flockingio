@@ -27,3 +27,28 @@ test('the app presents server results and fresh respawn', () => {
   assert.match(app, /network\?\.setHidden\(document\.hidden\)/);
   assert.match(html, /새 편대로 출격/);
 });
+
+test('the fleet entry keeps live presentation without inactive ground or feed paths', () => {
+  assert.match(app, /import \{ FleetAudio \} from '\.\/fleet-audio\.mjs'/);
+  assert.match(app, /new FleetBattleGame\(\)/);
+  assert.match(app, /scenery\.draw\(/);
+  assert.match(app, /drawEdgeIndicators\(\)/);
+  assert.match(app, /drawMinimap\(\)/);
+  assert.match(app, /game\.rings/);
+  assert.match(app, /game\.particles/);
+  assert.match(app, /sound\.update\(game\)/);
+  assert.doesNotMatch(app, /sound\.play\('boost'\)|sound\.play\('gather'\)|wasBoosting|wasGathering/);
+  assert.doesNotMatch(app, /battlefield-view|bombardment\.mjs|FIRE_SUPPORT|nearestRequest/);
+  assert.doesNotMatch(app, /drawGroundWar|drawBombs|drawAirDefense|game\.food|game\.bombardment/);
+  assert.doesNotMatch(app, /headScaleForLevel|HEAD_GROWTH|game\.practice|훈련 편대/);
+  assert.doesNotMatch(app, /signalLoss|linkFeed|cancelSignal|updateEffects|skipFeed|feed-lost|sound\.handle/);
+  assert.doesNotMatch(app, /onEvent:|new FleetBattleGame\(\{/);
+});
+
+test('nickname storage migrates the name without constructing legacy ranking state', () => {
+  assert.doesNotMatch(app, /RankingClient|ranking\.mjs|rankings\./);
+  assert.match(app, /readStorage\('flocking-nickname', null\) \?\? readStorage\('murmur-player-v1', \{\}\)\?\.nickname/);
+  assert.match(app, /saveStorage\('flocking-nickname', nickname\)/);
+  assert.match(app, /validNickname\(nickname\)/);
+  assert.match(app, /setNickname\(suggestNickname\(/);
+});

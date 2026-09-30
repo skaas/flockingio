@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { openDatabase } from './sqlite.mjs';
 import { handleAPI, initializeDatabase } from './api.mjs';
-import { AUDIO_FILES } from '../src/audio.mjs';
+import { AUDIO_FILES } from '../src/fleet-audio.mjs';
 import { IMAGE_FILES } from '../src/sprites.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));

@@ -1,14 +1,11 @@
-import { Game, WORLD_RADIUS, HEAD_GROWTH, headScaleForLevel, angleDelta, clamp, lerp, timeLabel } from './engine.mjs';
+import { Game, WORLD_RADIUS, angleDelta, clamp, lerp, timeLabel } from './engine.mjs';
 import { FleetBattleGame } from './fleet-battle.mjs';
 import { Scenery } from './scenery.mjs';
 import { generateBattlefield, battlefieldSeed, MAP_HALF } from './battlefield-map.mjs';
-import { FIRE_SUPPORT } from './bombardment.mjs';
-import { drawGroundWar, drawBombs, drawAirDefense } from './battlefield-view.mjs';
-import { RankingClient } from './ranking.mjs';
 import { normalizeNickname, validNickname, suggestNickname } from './identity.mjs';
 import { MouseFlightInput } from './mouse-input.mjs';
 import { FleetNetworkSession, preloadFleetNetworkModules } from './fleet-network.mjs';
-import { GameAudio } from './audio.mjs';
+import { FleetAudio } from './fleet-audio.mjs';
 import { loadSprites, sprite } from './sprites.mjs';
 import { VIEWPORT, fitViewport, clientToLogical } from './viewport.mjs';
 import { commanderCallsign } from './fleet-standings.mjs';
@@ -44,106 +41,10 @@ const renderOrder = [], renderFactions = new Map();
 let activeModal = null, modalOrigin = null;
 // Standings rows are rebuilt only when the field or a commander's drone count changes.
 let standingsKey = '';
-// Only the pilot name is used; stored records, tapes and queued scores stay untouched.
-const rankings = new RankingClient();
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
-// Screen effects are presentation only: they never read or advance the seeded simulation.
-const fxFlash = $('fx-flash'), fxSignal = $('fx-signal'), fxNoise = $('fx-noise').getContext('2d');
-let shakeTime = 0, shakeAmp = 0, signalTimer = 0, signalDone = null;
-const SHAKE_SECONDS = .28, SIGNAL_SECONDS = .5;
-// Overlays are placed as a share of the logical frame so they track the fitted shell at any scale.
-const framePercent = (value, size) => `${(value / size * 100).toFixed(3)}%`;
-function blast(x, y, strength) {
-  if (!Number.isFinite(x) || !Number.isFinite(y) || !game.player) return;
-  const near = Math.max(0, 1 - Math.hypot(x - game.player.x, y - game.player.y) / 260) * strength;
-  if (near < .05) return;
-  if (!reducedMotion) { shakeAmp = Math.max(shakeTime > 0 ? shakeAmp : 0, 7 * near); shakeTime = SHAKE_SECONDS; }
-  fxFlash.style.setProperty('--fx-x', framePercent((x - camera.x) * camera.zoom + width / 2, width));
-  fxFlash.style.setProperty('--fx-y', framePercent((y - camera.y) * camera.zoom + height / 2, height));
-  fxFlash.animate?.([{ opacity: (reducedMotion ? .2 : .55) * near }, { opacity: 0 }], { duration: 320, easing: 'ease-out' });
-}
-// A shoot-down plays as one scene: see the hit, watch the feed degrade, then read the
-// debrief over the recovered last frame. Residual static stays until the next sortie.
-const FEED_IMPACT = .35, FEED_DEGRADE = .55, FEED_LINK = .25;
-const fxHit = $('fx-hit'), fxLabel = $('fx-signal').querySelector('span');
-let feed = null, noiseClock = 0;
-function signalLoss(then) {
-  const p = game.player;
-  blast(p.x, p.y, 1.3);
-  fxHit.style.left = framePercent((p.x - camera.x) * camera.zoom + width / 2, width);
-  fxHit.style.top = framePercent((p.y - camera.y) * camera.zoom + height / 2, height);
-  fxHit.hidden = false; fxHit.getAnimations?.().forEach(animation => animation.cancel());
-  fxHit.classList.remove('struck'); void fxHit.offsetWidth; fxHit.classList.add('struck');
-  feed = { phase: 'impact', t: 0, done: then };
-  if (reducedMotion) finishFeedLoss();
-}
-function showFeedPhase(phase, label) {
-  fxSignal.dataset.phase = phase; fxSignal.hidden = false;
-  if (label) fxLabel.textContent = label;
-}
-function finishFeedLoss() {
-  if (!feed || feed.phase === 'residual') return;
-  const done = feed.done;
-  feed = { phase: 'residual', t: 0 };
-  canvas.classList.add('feed-lost'); document.body.classList.add('feed-down'); showFeedPhase('residual');
-  fxSignal.style.setProperty('--noise', 1);
-  done?.();
-}
-function cancelSignal() {
-  feed = null; fxSignal.hidden = true; fxHit.hidden = true; fxHit.classList.remove('struck');
-  canvas.classList.remove('feed-lost'); document.body.classList.remove('feed-down'); fxSignal.style.setProperty('--noise', 0);
-}
-// Retrying reconnects the feed instead of cutting straight to a clean picture.
-function linkFeed() {
-  if (reducedMotion) return;
-  feed = { phase: 'link', t: 0 }; fxSignal.style.setProperty('--noise', 1);
-  showFeedPhase('link', '신호 연결'); sound.play('signalLink');
-}
-function skipFeed(event) {
-  if (feed?.phase !== 'impact' && feed?.phase !== 'degrade') return;
-  if (event.type === 'keydown' && !['Enter', ' ', 'Escape'].includes(event.key)) return;
-  event.preventDefault(); event.stopPropagation(); finishFeedLoss();
-}
-addEventListener('pointerdown', skipFeed, true);
-addEventListener('keydown', skipFeed, true);
-function drawNoise(tear = true) {
-  const image = fxNoise.createImageData(160, 90), data = image.data, band = Math.random() * 90;
-  for (let i = 0; i < data.length; i += 4) {
-    const row = (i >> 2) / 160 | 0, v = Math.random() * (tear && Math.abs(row - band) < 5 ? 255 : 150);
-    data[i] = v * .85; data[i + 1] = v; data[i + 2] = v * .9; data[i + 3] = 255;
-  }
-  fxNoise.putImageData(image, 0, 0);
-}
-function updateEffects(dt) {
-  if (shakeTime > 0) {
-    shakeTime = Math.max(0, shakeTime - dt);
-    const k = shakeAmp * shakeTime / SHAKE_SECONDS;
-    canvas.style.transform = k > .15 ? `translate(${((Math.random() * 2 - 1) * k).toFixed(1)}px, ${((Math.random() * 2 - 1) * k).toFixed(1)}px)` : '';
-  }
-  if (!feed) return;
-  feed.t += dt;
-  if (feed.phase === 'impact' && feed.t >= FEED_IMPACT) {
-    feed.phase = 'degrade'; feed.t = 0;
-    canvas.classList.add('feed-lost'); document.body.classList.add('feed-down');
-    showFeedPhase('degrade', '신호 두절'); sound.play('signalLost');
-  }
-  if (feed.phase === 'degrade') {
-    fxSignal.style.setProperty('--noise', Math.min(1, feed.t / FEED_DEGRADE).toFixed(3));
-    drawNoise();
-    if (feed.t >= FEED_DEGRADE) finishFeedLoss();
-  } else if (feed.phase === 'residual') {
-    // A slow residual shimmer: enough to read as a lost feed, never enough to distract.
-    noiseClock += dt;
-    if (noiseClock > .09 && !reducedMotion) { noiseClock = 0; drawNoise(false); }
-  } else if (feed.phase === 'link') {
-    fxSignal.style.setProperty('--noise', Math.max(0, 1 - feed.t / FEED_LINK).toFixed(3));
-    drawNoise();
-    if (feed.t >= FEED_LINK) cancelSignal();
-  }
-}
 const readStorage = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
 const saveStorage = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* Private browsing can disable storage. */ } };
-const sound = new GameAudio({ ...readStorage('murmur-audio', {}), enabled: readStorage('murmur-sound', true) });
+const sound = new FleetAudio({ ...readStorage('murmur-audio', {}), enabled: readStorage('murmur-sound', true) });
 
 // The logical frame never changes; only the fitted shell and backing density follow the display.
 // Body padding carries the safe-area insets, so its content box is the space the shell may use.
@@ -201,7 +102,7 @@ for (const slider of document.querySelectorAll('[data-volume]')) {
   slider.addEventListener('input', () => saveSound({ [slider.dataset.volume]: Number(slider.value) / 100 }));
   slider.addEventListener('change', () => { if (slider.dataset.volume === 'effects') sound.play('ui'); });
 }
-// Unlock synchronously on a real gesture, before nickname registration awaits the server.
+// Unlock synchronously on a real gesture, before joining the room awaits the server.
 addEventListener('pointerdown', () => sound.unlock(), { capture: true });
 document.addEventListener('click', event => {
   if (event.target.closest?.('button, summary') && !event.target.closest('#sound, .sound-toggle')) sound.play('ui');
@@ -239,23 +140,25 @@ function showModal(id) {
     modalOrigin = null;
   }
 }
-function onEvent(event) {
-  sound.handle(event, game);
-  if (event.type === 'flak-impact') blast(event.x, event.y, 1);
-  if (event.type === 'bomb-impact') blast(event.x ?? event.request?.x, event.y ?? event.request?.y, .45);
-}
-let game = new FleetBattleGame({ onEvent });
+let game = new FleetBattleGame();
 let network = null;
 let viewingRoom = false;
 let roomSeed = null;
 
-
-if (!validNickname(rankings.profile.nickname)) rankings.setNickname(suggestNickname());
-$('nickname').value = rankings.profile.nickname;
+// Carry forward the old profile's name once, without constructing replay or ranking state.
+const savedNickname = readStorage('flocking-nickname', null) ?? readStorage('murmur-player-v1', {})?.nickname;
+let nickname = typeof savedNickname === 'string' ? normalizeNickname(savedNickname) : '';
+if (!validNickname(nickname)) nickname = suggestNickname();
+function setNickname(value) {
+  nickname = value;
+  saveStorage('flocking-nickname', nickname);
+}
+setNickname(nickname);
+$('nickname').value = nickname;
 $('nickname').addEventListener('input', () => { $('nickname').setCustomValidity(''); $('nickname-error').hidden = true; });
 $('shuffle-nickname').addEventListener('click', () => {
-  rankings.setNickname(suggestNickname(normalizeNickname($('nickname').value)));
-  $('nickname').value = rankings.profile.nickname;
+  setNickname(suggestNickname(normalizeNickname($('nickname').value)));
+  $('nickname').value = nickname;
   $('nickname').setCustomValidity(''); $('nickname-error').hidden = true;
   $('nickname').focus({ preventScroll: true });
 });
@@ -267,7 +170,7 @@ function beginRun() {
     $('nickname').setCustomValidity(message); $('nickname-error').textContent = message; $('nickname-error').hidden = false;
     $('nickname').reportValidity(); $('nickname').focus({ preventScroll: true }); return;
   }
-  rankings.setNickname(nickname); $('nickname').value = nickname;
+  setNickname(nickname); $('nickname').value = nickname;
   connectToRoom(nickname);
 }
 
@@ -294,7 +197,7 @@ function showRoom(replica) {
   }
   if (entityChanged) {
     displayedEntityId = network.entityId;
-    resetInput(); showModal(null); cancelSignal();
+    resetInput(); showModal(null);
     camera = { x: 0, y: 0, zoom: 1.2 }; cameraMotion = { x: 0, y: 0 };
     standingsKey = ''; toastTimer = 0;
     $('end-error').textContent = '';
@@ -316,11 +219,6 @@ function connectToRoom(nickname) {
   if (network?.status === 'connecting' || network?.connected) return;
   network?.disconnect();
   const session = new FleetNetworkSession({
-    onEvent: event => {
-      // Ambient impacts are spatial. Reference-player kill/allegiance events do
-      // not describe this connection's pilot and must never play as local ones.
-      if (event.type === 'flak-impact' || event.type === 'bomb-impact') onEvent(event);
-    },
     onState: (status, detail) => {
       if (network !== session) return;
       if (status === 'connecting') { $('start').disabled = true; entryStatus('서버에 연결하는 중…'); }
@@ -339,7 +237,7 @@ function connectToRoom(nickname) {
     onWelcome: () => { if (network === session && session.replica) showRoom(session.replica); },
     onResult: result => {
       if (network !== session) return;
-      resetInput(); cancelSignal(); renderFleetResult(result);
+      resetInput(); renderFleetResult(result);
       $('end-error').textContent = '';
       $('restart').disabled = false; $('restart').textContent = '새 편대로 출격';
       showModal('end-modal');
@@ -353,10 +251,9 @@ function connectToRoom(nickname) {
   if (document.hidden) session.setHidden(true);
 }
 function resetToHome() {
-  cancelSignal();
   sound.reset(); sound.setScene('home', 0, false);
   viewingRoom = false; roomSeed = null; displayedEntityId = null;
-  game = new FleetBattleGame({ onEvent }); game.state = 'home';
+  game = new FleetBattleGame(); game.state = 'home';
   resetInput(); showModal(null); $('home').hidden = false; $('hud').hidden = true; $('pause').hidden = true; $('run-clock').hidden = true;
   document.body.classList.remove('playing', 'fleet-battle'); $('start').focus({ preventScroll: true });
   $('start').disabled = false;
@@ -475,12 +372,6 @@ function updateStandings() {
     item.append(rank, name, count);
     return item;
   }));
-}
-
-function nearestRequest() {
-  const requests = game.bombardment.requests.filter(r => r.state !== 'complete');
-  return requests.find(r => r.id === game.bombardment.activeId) ?? requests.sort((a, b) =>
-    Math.hypot(a.x - game.player.x, a.y - game.player.y) - Math.hypot(b.x - game.player.x, b.y - game.player.y))[0];
 }
 
 function drone(x, y, angle, size, color, alpha = 1, faction = 'hostile') {
@@ -696,15 +587,8 @@ function drawWorld(dt) {
   const centerX = sumX / (p.boids.length + 1), centerY = sumY / (p.boids.length + 1);
   let focusX = lerp(centerX, p.x, .48) + Math.cos(p.angle) * 22;
   let focusY = lerp(centerY, p.y, .48) + Math.sin(p.angle) * 22;
-  const groundTarget = nearestRequest();
-  const targetDistance = groundTarget ? Math.hypot(groundTarget.x - p.x, groundTarget.y - p.y) : Infinity;
-  const targetFraming = clamp((380 - targetDistance) / 130, 0, 1);
-  if (groundTarget && targetFraming) {
-    focusX = lerp(focusX, groundTarget.x, .35 * targetFraming);
-    focusY = lerp(focusY, groundTarget.y, .35 * targetFraming) - 40 * targetFraming;
-  }
   // In a fleet battle, keep a nearby rival commander in view as it closes in.
-  const rival = game.practice === 'fleet-battle' ? fleetRival() : null;
+  const rival = fleetRival();
   const rivalFraming = rival ? clamp((600 - Math.hypot(rival.x - p.x, rival.y - p.y)) / 150, 0, 1) : 0;
   if (rivalFraming) {
     focusX = lerp(focusX, rival.x, .32 * rivalFraming); focusY = lerp(focusY, rival.y, .32 * rivalFraming);
@@ -714,20 +598,12 @@ function drawWorld(dt) {
     extentX = Math.max(extentX, Math.abs(b.x - focusX));
     extentY = Math.max(extentY, Math.abs(b.y - focusY));
   }
-  if (groundTarget && targetFraming) {
-    extentX = Math.max(extentX, Math.abs(groundTarget.x - focusX) + (FIRE_SUPPORT.radius + 12) * targetFraming);
-    extentY = Math.max(extentY, Math.abs(groundTarget.y - focusY) + (FIRE_SUPPORT.radius + 30) * targetFraming);
-  }
   if (rivalFraming) {
     extentX = Math.max(extentX, (Math.abs(rival.x - focusX) + 40) * rivalFraming);
     extentY = Math.max(extentY, (Math.abs(rival.y - focusY) + 40) * rivalFraming);
   }
-  // Start closer to the flock, then gradually widen the view as the leader
-  // evolves. The fit limits still protect the flock from being clipped.
-  const closeZoom = 1.5;
-  const evolutionProgress = clamp((headScaleForLevel(game.level) - 1) / (HEAD_GROWTH.maxScale - 1), 0, 1);
-  const evolutionZoom = lerp(1, .78, evolutionProgress);
-  const targetZoom = Math.min(closeZoom * evolutionZoom, (width / 2 - 28) / extentX, (height / 2 - 110) / extentY);
+  // Keep the connected flock in frame as its drone count grows.
+  const targetZoom = Math.min(1.5, (width / 2 - 28) / extentX, (height / 2 - 110) / extentY);
   const previousX = camera.x, previousY = camera.y;
   camera.x = lerp(camera.x, focusX, 1 - Math.exp(-dt * 4)); camera.y = lerp(camera.y, focusY, 1 - Math.exp(-dt * 4));
   if (dt > 0) {
@@ -741,15 +617,6 @@ function drawWorld(dt) {
   // The finite arena is a soft current: entering its edge steers a head inward.
   ctx.strokeStyle = '#7cad8960'; ctx.lineWidth = 2; ctx.setLineDash([5, 12]); ctx.beginPath(); ctx.arc(0, 0, WORLD_RADIUS, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
   ctx.strokeStyle = '#6695730a'; ctx.lineWidth = 70; ctx.beginPath(); ctx.arc(0, 0, WORLD_RADIUS + 35, 0, Math.PI * 2); ctx.stroke();
-  drawGroundWar(ctx, game, camera, onScreen, reducedMotion);
-  for (const f of game.food) {
-    if (!onScreen(f.x, f.y, 20)) continue;
-    const shimmer = .65 + Math.sin(visualTime * 2 + f.seed) * .2, size = f.value > 1 ? 3.2 : 1.9;
-    ctx.fillStyle = f.source === 'strike' ? '#ffd08a' : f.value > 1 ? colors.amber : '#d6b27a'; ctx.globalAlpha = shimmer;
-    if (f.value > 1) { ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(Math.PI / 4); ctx.fillRect(-size, -size, size * 2, size * 2); ctx.restore(); }
-    else { ctx.beginPath(); ctx.arc(f.x, f.y, size, 0, Math.PI * 2); ctx.fill(); }
-    ctx.globalAlpha = .05; ctx.beginPath(); ctx.arc(f.x, f.y, size * 4, 0, Math.PI * 2); ctx.fill();
-  }
   ctx.globalAlpha = 1;
   renderOrder.length = 0; renderFactions.clear();
   for (const e of game.entities) {
@@ -808,13 +675,7 @@ function drawWorld(dt) {
       ctx.beginPath(); ctx.arc(e.x, e.y, e.radius + 9, 0, Math.PI * 2); ctx.stroke(); ctx.globalAlpha = 1;
     }
     if (e.player) leaderHeading(e);
-    if (!e.player && game.practice === 'recruitment') {
-      ctx.font = '10px system-ui'; ctx.textAlign = 'center'; ctx.fillStyle = color; ctx.globalAlpha = .8;
-      ctx.fillText(`훈련 편대 · ${e.boids.length}기`, e.x, e.y - 28); ctx.globalAlpha = 1;
-    }
   }
-  drawBombs(ctx, game, reducedMotion);
-  drawAirDefense(ctx, game, camera, reducedMotion);
   for (const r of game.rings) { ctx.strokeStyle = colors[r.color]; ctx.lineWidth = 1; ctx.globalAlpha = r.life * .45; ctx.beginPath(); ctx.arc(r.x, r.y, Math.max(1, (1 - r.life) * r.max), 0, Math.PI * 2); ctx.stroke(); }
   for (const particle of game.particles) { ctx.fillStyle = colors[particle.color]; ctx.globalAlpha = particle.life * .7; ctx.beginPath(); ctx.arc(particle.x, particle.y, 1.7, 0, Math.PI * 2); ctx.fill(); }
   ctx.globalAlpha = 1;
@@ -829,18 +690,6 @@ function drawWorld(dt) {
 }
 function drawEdgeIndicators() {
   if (game.state !== 'playing') return;
-  const request = nearestRequest();
-  if (request) {
-    const sx = (request.x - camera.x) * camera.zoom + width / 2, sy = (request.y - camera.y) * camera.zoom + height / 2;
-    if (sx < 32 || sx > width - 32 || sy < 185 || sy > height - 240) {
-      const angle = Math.atan2(sy - height / 2, sx - width / 2);
-      const reach = Math.min((width / 2 - 30) / Math.max(.001, Math.abs(Math.cos(angle))), (height / 2 - 195) / Math.max(.001, Math.abs(Math.sin(angle))));
-      const x = width / 2 + Math.cos(angle) * Math.max(30, reach), y = height / 2 + Math.sin(angle) * Math.max(30, reach);
-      ctx.save(); ctx.translate(x, y); ctx.rotate(angle); ctx.fillStyle = '#efbb77';
-      ctx.beginPath(); ctx.moveTo(8, 0); ctx.lineTo(-4, -5); ctx.lineTo(-4, 5); ctx.closePath(); ctx.fill(); ctx.restore();
-      ctx.font = '10px system-ui'; ctx.fillStyle = '#efbb77'; ctx.textAlign = 'center'; ctx.fillText('요청', x, y + 19);
-    }
-  }
   for (const e of game.entities) {
     if (e.player || !e.alive) continue;
     const sx = (e.x - camera.x) * camera.zoom + width / 2, sy = (e.y - camera.y) * camera.zoom + height / 2;
@@ -864,12 +713,6 @@ function drawMinimap() {
   }
   map.beginPath(); map.arc(80, 80, 70, 0, Math.PI * 2); map.stroke();
   map.strokeStyle = '#7ca78e13'; map.beginPath(); map.moveTo(10, 80); map.lineTo(150, 80); map.moveTo(80, 10); map.lineTo(80, 150); map.stroke();
-  for (const r of game.bombardment.requests) {
-    map.strokeStyle = r.state === 'complete' ? colors.lime : colors.amber; map.lineWidth = 1.5;
-    const x = 80 + r.x * scale, y = 80 + r.y * scale;
-    map.strokeRect(x - 3, y - 3, 6, 6);
-    if (r.id === game.bombardment.activeId) { map.beginPath(); map.arc(x, y, 7, 0, Math.PI * 2); map.stroke(); }
-  }
   for (const e of game.entities) {
     if (!e.alive) continue; map.fillStyle = e.player ? colors.lime : colors.coral; map.globalAlpha = e.player ? 1 : .55;
     map.beginPath(); map.arc(80 + e.x * scale, 80 + e.y * scale, e.player ? 3 : 1.8, 0, Math.PI * 2); map.fill();
@@ -884,7 +727,7 @@ function frame(now) {
     if (!activeModal && document.hasFocus() && !document.hidden) network.sendInput(getInput(), dt);
   }
   if (toastTimer > 0) { toastTimer -= dt; if (toastTimer <= 0) $('toast').classList.remove('visible'); }
-  sound.update(game); updateEffects(dt);
+  sound.update(game);
   if (viewingRoom) drawWorld(dt); else drawHome(dt);
   hudTime += dt; if (hudTime > .1 && viewingRoom) { updateHUD(); hudTime = 0; }
   requestAnimationFrame(frame);

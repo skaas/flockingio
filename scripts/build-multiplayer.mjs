@@ -2,7 +2,7 @@ import { copyFile, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
-import { AUDIO_FILES } from '../src/audio.mjs';
+import { AUDIO_FILES } from '../src/fleet-audio.mjs';
 import { IMAGE_FILES } from '../src/sprites.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));

@@ -1,7 +1,7 @@
 import { copyFile, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname, posix } from 'node:path';
-import { AUDIO_FILES } from '../src/audio.mjs';
+import { AUDIO_FILES } from '../src/fleet-audio.mjs';
 import { IMAGE_FILES } from '../src/sprites.mjs';
 import { writeClientVendor } from './build-multiplayer.mjs';
 
